@@ -1,0 +1,19 @@
+========== Energy Calibration Result ==========
+
+Seed = 42
+Cloud sample count = 1000
+
+CLOUD_CPU_POWER_PER_UNIT_W = 0.4711224668
+CLOUD_GPU_POWER_PER_UNIT_W = 226.9522878688
+TRANSFER_SEND_FIXED_ENERGY_J = 866.1977250342
+TRANSFER_RECEIVE_FIXED_ENERGY_J = 866.1977250342
+TRANSFER_LATENCY_ENERGY_COEFFICIENT_W = 628.4384945835
+
+Cloud/Edge median ratio = 1.0086175633
+Cloud/Edge within ±15% = 0.8660000000
+Cloud fitting RMSE W = 8.7997460342
+Cloud/Edge P05 ratio = 0.7811424750
+Cloud/Edge P95 ratio = 1.0086618326
+Reference compute energy J = 96884.2679149535
+Median Edge->Edge latency s = 3.4100000000
+Median Edge->Cloud latency s = 12.6600000000

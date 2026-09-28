@@ -1,0 +1,7 @@
+name: MYENV1
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - seaborn
+prefix: C:\Users\LeQii\.conda\envs\MYENV1
