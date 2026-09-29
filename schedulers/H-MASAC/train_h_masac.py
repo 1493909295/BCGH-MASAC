@@ -166,6 +166,8 @@ class EpisodeStatistics:
     # Host Update Metrics：逐 DC
     host_update_metric_sums_by_dc: Dict[str, Dict[str, float],] = field(default_factory=dict)
     host_update_metric_counts_by_dc: Dict[ str,Dict[str, int],] = field(default_factory=dict)
+    pending_routing_update_infos: list = field(default_factory=list)
+    pending_host_update_infos: list = field(default_factory=list)
 
     # Per-DC Counters
     dc_counters: Dict[str,Dict[str, int],] = field(default_factory=dict)
@@ -1092,14 +1094,11 @@ def record_routing_update_block(
     只记录 Routing MASAC update 指标。
     """
 
-    for update_info in (
-        _convert_update_block_to_cpu(
-            update_infos
-        )
-    ):
-        stats.record_routing_update(
-            update_info
-        )
+    stats.pending_routing_update_infos.extend(
+        {name: value.detach() if torch.is_tensor(value) else value
+         for name, value in update_info.items()}
+        for update_info in update_infos
+    )
 
 
 def record_host_update_block(
@@ -1119,17 +1118,26 @@ def record_host_update_block(
     只记录指定 DC 的 Local Host SAC update 指标。
     """
 
-    for update_info in (
-        _convert_update_block_to_cpu(
-            update_infos
-        )
+    stats.pending_host_update_infos.extend(
+        (dc_id, {name: value.detach() if torch.is_tensor(value) else value
+                 for name, value in update_info.items()})
+        for update_info in update_infos
+    )
+
+
+def flush_pending_update_metrics(stats: EpisodeStatistics) -> None:
+    """Read detached update metrics once per episode, before building logs."""
+    for update_info in _convert_update_block_to_cpu(stats.pending_routing_update_infos):
+        stats.record_routing_update(update_info)
+    stats.pending_routing_update_infos.clear()
+
+    host_updates = stats.pending_host_update_infos
+    for (dc_id, _), update_info in zip(
+        host_updates,
+        _convert_update_block_to_cpu([info for _, info in host_updates]),
     ):
-        stats.record_host_update(
-            dc_id=dc_id,
-            update_info=(
-                update_info
-            ),
-        )
+        stats.record_host_update(dc_id=dc_id, update_info=update_info)
+    host_updates.clear()
 
 
 def flush_finalized_trace_to_replay(
@@ -7364,6 +7372,8 @@ def train(
             )
             pending_trace_store.assert_no_open_trace()
             pending_trace_store.assert_no_unflushed_finalized_trace()
+
+            flush_pending_update_metrics(stats)
 
             # 计算当前 episode 的真实运行秒数。
             wall_time_seconds = (time.perf_counter() - episode_wall_start)

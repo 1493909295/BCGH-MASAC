@@ -1458,6 +1458,10 @@ class LocalHostSAC:
             batch_size=batch_size,
             replace=False,
         )
+        if not np.all(replay_batch.done > 0.5):
+            raise RuntimeError(
+                "HostReplayBuffer 中出现 non-terminal Host transition。"
+            )
 
         batch = self._batch_to_tensors(
             replay_batch
@@ -1643,17 +1647,6 @@ class LocalHostSAC:
 
         不使用其他 Job 的 Host Observation bootstrap。
         """
-
-        if not bool(
-                torch.all(
-                    batch.done
-                    > 0.5
-                ).item()
-        ):
-            raise RuntimeError(
-                "HostReplayBuffer 中出现 "
-                "non-terminal Host transition。"
-            )
 
         target_q = (
             batch.rewards.detach()

@@ -1,5 +1,81 @@
+# =============================================================================
+# Training outputs
+# =============================================================================
+
+# Experiment results, evaluation outputs, and generated reports
+result/
+results/
+output/
+outputs/
+artifacts/
+
+# Training logs and visualisation runs
+logs/
+runs/
+wandb/
+tensorboard/
+events.out.tfevents*
+*.log
+*.guidance.jsonl
+current_*_log.txt
+
+# Model checkpoints and their metadata
+checkpoints/
+checkpoint/
+*.pt
+*.pth
+*.ckpt
+*.trainer.json
+
+# Temporary/intermediate files produced by atomic checkpoint writes or jobs
+*.tmp
+*.temp
+*.part
+*.bak
+
+# =============================================================================
+# Local data and environments
+# =============================================================================
+
+# Local datasets are not uploaded with the source repository
 /dataset/
-/result/MASAC/
+
+# Project-specific generated environment state
 /environment/env_keep/
-/schedulers/MASAC/model/
-/schedulers/MASAC/result/
+
+# Local secrets and environment overrides
+.env
+.env.*
+!.env.example
+
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# =============================================================================
+# Python caches and test/build outputs
+# =============================================================================
+
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# =============================================================================
+# Editor and operating-system files
+# =============================================================================
+
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
