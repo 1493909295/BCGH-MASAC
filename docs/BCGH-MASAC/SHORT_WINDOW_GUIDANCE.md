@@ -1,7 +1,7 @@
-# BGH 短窗口引导 v3
+# BCGH 短窗口引导 v3
 
 贝叶斯结果、收益、Actor 的邻居反馈和竞争需求都只保留当前回合的
-`(t - BGH_SHORT_WINDOW_S, t]`。默认窗口为 1200 仿真秒，数据集任务时长中位数
+`(t - BCGH_SHORT_WINDOW_S, t]`。默认窗口为 1200 仿真秒，数据集任务时长中位数
 约为 616 秒；该值是初始实验参数，不是最优窗口的结论。
 较长任务的结果可能因转发时间过旧而被排除，因此窗口结果统计偏向较快闭合的任务。
 
@@ -79,21 +79,21 @@ Host 预训练 lambda=0；Routing 阶段 0→1；Joint 阶段 1→0.3。
 CSV 另外记录首次 Edge 吸收率、Edge→Edge、Edge→Cloud、DROP、P95 跳数以及
 每个目标 DC 的入站去向。反馈字段沿用原有七维字段名，`*_ewma` 是窗口均值。
 
-检查点保存 `bgh_guidance.version=3` 和全部参数。回合边界保存，无需携带跨回合
-窗口状态。开启 BGH 时，旧累计信念检查点或不同参数的检查点不能静默续训。
-MASAC/H-MASAC 基线文件未修改；关闭 BGH 两开关仍走原来的等价路径。
+检查点沿用兼容字段 `bgh_guidance.version=3` 和全部参数。回合边界保存，无需携带跨回合
+窗口状态。开启 BCGH 时，旧累计信念检查点或不同参数的检查点不能静默续训。
+MASAC/H-MASAC 基线文件未修改；关闭 BCGH 两开关仍走原来的等价路径。
 
 ## 评估
 
-`evaluate_bgh_masac.evaluate_episode(env, routing_agent, host_agents, settings)`
+`schedulers.BCGH-MASAC.training_support.evaluate_episode(env, routing_agent, host_agents, settings)`
 用于已加载模型；环境拓扑和主机顺序必须与训练检查点一致，settings 使用检查点
 `bgh_guidance.parameters` 中的配置。函数在一次全新回合里更新相同的短窗口状态，
 固定使用 `guidance_lambda_stage3_end`（默认 0.3），不更新网络、不写训练检查点。
-仅调用基础 Actor 的 select_action 不代表完整 BGH 方法。
+仅调用基础 Actor 的 select_action 不代表完整 BCGH 方法。
 
 ## 验证
 
-运行 `python -B -m unittest discover -s tests -p test_bgh_short_window.py -v`。
+运行 `python -B -m unittest discover -s tests -p test_bcgh_short_window.py -v`。
 行为测试不要求 GPU；三阶段训练与完整评估的集成测试沿用项目 CUDA 要求，
 使用小网络和 24 个任务，在专用临时目录保存并清理检查点与日志。
 这些测试验证接线和性质，不构成性能提升或均衡收敛的证明。

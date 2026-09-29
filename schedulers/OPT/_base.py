@@ -1,4 +1,4 @@
-"""Qualified imports keep the shared H-MASAC implementation isolated from BGH.
+"""Qualified imports keep the shared H-MASAC implementation isolated from BCGH.
 
 The existing directory name contains a hyphen, so use importlib instead of
 adding it to sys.path or importing ambiguous names such as h_masac_agent.

@@ -21,7 +21,7 @@ Critic 使用原有全局状态，Host observation 不变。Cloud 关闭时保�
 
 每次决策都读取当前 `env.dc_map`。历史经验保存独立副本，转发任务的后继观测
 在下一真实决策时捕获。OPT 不读取尚未到达任务或未来事件，不增加未来负载预测、
-资源预约、全局动作掩码或 BGH 策略偏置。状态共享假定实时且免费；任务传输仍有成本。
+资源预约、全局动作掩码或 BCGH 策略偏置。状态共享假定实时且免费；任务传输仍有成本。
 
 ## 训练
 
@@ -91,7 +91,7 @@ OPT 检查点具有独立算法身份，并保存观测版本、特征及 DC 顺
 python -m schedulers.OPT.train_opt --old-env environment/env_keep/你的环境目录 --resume model/OPT/checkpoints/final.pt --joint-finetune-episodes 400
 ```
 
-旧 H/BGH Routing 模型不能作为 OPT Routing 模型加载。要复用已有 Host 权重，可设置
+旧 H/BCGH Routing 模型不能作为 OPT Routing 模型加载。要复用已有 Host 权重，可设置
 `OPT_HOST_INIT_CHECKPOINT` 或传入 `--host-init-checkpoint`，指向双层检查点的 Routing `.pt`
 路径；实际只读取其配套 Host 文件。初始化会检查 DC/Host 顺序和观测/动作维度，
 需要使用兼容的 Host 网络大小。Host 优化器和训练计数重新开始，随后按配置参加训练。
@@ -116,7 +116,7 @@ Cloud 开关、DC/Host 顺序或观测结构不匹配时会拒绝加载。
 
 程序调用入口为 `train_opt.train(...)`、`evaluate_opt.load_models(env, checkpoint)`
 和 `evaluate_opt.evaluate_episode(env, routing_agent, host_agents, settings)`。
-复用模块通过完整包名导入，不依赖 H/BGH 同名文件的搜索路径优先级。
+复用模块通过完整包名导入，不依赖 H/BCGH 同名文件的搜索路径优先级。
 
 ## 验证
 
