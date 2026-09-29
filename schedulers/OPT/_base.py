@@ -6,7 +6,7 @@ adding it to sys.path or importing ambiguous names such as h_masac_agent.
 from importlib import import_module
 
 trainer = import_module("schedulers.H-MASAC.train_h_masac")
-observations = import_module("schedulers.H-MASAC.routing_observation")
+observations = import_module("schedulers.H-MASAC.observations")
 agents = import_module("schedulers.H-MASAC.h_masac_agent")
 
 RoutingMASACConfig = agents.RoutingMASACConfig
