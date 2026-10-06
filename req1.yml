@@ -1,5 +1,5 @@
 # Portable export of the Windows MYENV1 environment for a Linux x86_64
-# server with an NVIDIA driver compatible with CUDA 12.8.
+# server with an NVIDIA driver compatible with CUDA 12.6 (includes V100).
 # Create with: conda env create -f req1.yml
 # Faster alternative: mamba env create -f req1.yml
 name: MYENV1
@@ -13,10 +13,10 @@ dependencies:
   - setuptools=80.10.2
   - wheel=0.46.3
   - pip:
-      # CUDA-enabled PyTorch wheels matching the source environment.
-      - --extra-index-url https://download.pytorch.org/whl/cu128
-      - torch==2.11.0+cu128
-      - torchvision==0.26.0+cu128
+      # CUDA 12.6 wheels retain Volta / V100 (sm_70) support.
+      - --extra-index-url https://download.pytorch.org/whl/cu126
+      - torch==2.10.0+cu126
+      - torchvision==0.25.0+cu126
 
       # Core numerical and plotting stack.
       - numpy==2.2.5

@@ -1,5 +1,8 @@
 ## 总体流程描述
 
+V100/V100S 服务器请按 [GPU 环境安装说明](服务器端V100环境安装命令.txt) 安装支持显卡架构的 PyTorch。
+四个调度器在训练前检查实际 GPU 运算，失败时会给出当前构建信息及修复方法。
+
 新增 OPT 全局负载可观测调度器，运行 `python -m schedulers.OPT.train_opt`。
 训练、评估及检查点兼容规则见 [OPT 使用说明](schedulers/OPT/README.md)。
 

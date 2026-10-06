@@ -70,27 +70,10 @@ def validate_opt_device(device_name: str) -> str:
         return "cpu"
     if device.type != "cuda":
         raise ValueError(f"OPT supports CPU or CUDA, got {device_name!r}")
-    if not torch.cuda.is_available():
-        raise RuntimeError(
-            f"{device_name} 不可用；请检查 GPU/PyTorch 环境，或用 --device cpu 运行 OPT。"
-        )
     try:
-        x = torch.ones((8, 8), device=device, requires_grad=True)
-        y = (x @ x).exp().sum()
-        y.backward()
-        torch.cuda.synchronize(device)
+        return str(agents.resolve_training_device(device_name))
     except RuntimeError as exc:
-        try:
-            gpu_name = torch.cuda.get_device_name(device)
-        except Exception:
-            gpu_name = "unknown"
-        raise RuntimeError(
-            f"OPT 的 CUDA 预检失败：device={device_name}, GPU={gpu_name}, "
-            f"PyTorch={torch.__version__}。当前 PyTorch/CUDA 组合无法在此设备上完成"
-            "模型计算；请使用支持该 GPU 的 PyTorch 构建，或运行 "
-            "python -m schedulers.OPT.train_opt --device cpu。"
-        ) from exc
-    return str(device)
+        raise RuntimeError(f"{exc}\nOPT 也可显式使用 --device cpu 运行。") from exc
 
 
 def choose_opt_device(requested: str) -> str:

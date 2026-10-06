@@ -1,10 +1,12 @@
-"""CPU-only checks for deferred training metrics and Host replay validation."""
+"""Checks for deferred metrics, Host replay validation and CUDA compatibility."""
 
 import importlib
+import random
 from pathlib import Path
 import sys
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -89,6 +91,68 @@ class TransferOptimizationTests(unittest.TestCase):
                 trainer.flush_pending_update_metrics(actual)
                 self.assertEqual(actual.routing_update_count, 2)
                 self.assertEqual(actual.host_update_count, 2)
+
+
+class GPUCompatibilityTests(unittest.TestCase):
+    def setUp(self):
+        flat_agents = importlib.import_module("schedulers.MASAC.masac_agent")
+        self.resolvers = (
+            H_AGENTS.resolve_training_device, BCGH_AGENTS.resolve_training_device,
+            flat_agents.DiscreteMASAC._resolve_device,
+        )
+        for resolve in self.resolvers:
+            resolve.cache_clear()
+            self.addCleanup(resolve.cache_clear)
+
+    def test_visible_incompatible_v100_is_rejected_by_all_agents(self):
+        with patch.object(torch.cuda, "is_available", return_value=True), \
+             patch.object(torch.cuda, "device_count", return_value=1), \
+             patch.object(torch.cuda, "get_device_name", return_value="Tesla V100S-PCIE-32GB"), \
+             patch.object(torch.cuda, "get_device_capability", return_value=(7, 0)), \
+             patch.object(torch.cuda, "get_arch_list", return_value=["sm_75", "sm_80"]), \
+             patch.object(torch, "ones", side_effect=RuntimeError("no kernel image is available")):
+            for resolve in self.resolvers:
+                with self.subTest(resolve=resolve), self.assertRaises(RuntimeError) as error:
+                    resolve("cuda:0")
+                for text in ("V100S", "no kernel image", "cu126", sys.executable):
+                    self.assertIn(text, str(error.exception))
+
+    def test_hierarchical_training_checks_gpu_before_environment_creation(self):
+        with patch.object(torch.cuda, "is_available", return_value=False):
+            for trainer in (H_TRAINER, BCGH_TRAINER):
+                with self.subTest(trainer=trainer.__name__), \
+                     patch.object(trainer, "build_environment") as build:
+                    with self.assertRaisesRegex(RuntimeError, "CUDA 不可用"):
+                        trainer.train(trainer.TrainConfig())
+                    build.assert_not_called()
+
+    def test_cpu_requirement_and_invalid_gpu_index_are_preserved(self):
+        for resolve in self.resolvers:
+            with self.subTest(resolve=resolve), self.assertRaisesRegex(ValueError, "GPU"):
+                resolve("cpu")
+            with patch.object(torch.cuda, "is_available", return_value=True), \
+                 patch.object(torch.cuda, "device_count", return_value=1):
+                with self.assertRaisesRegex(RuntimeError, "GPU 编号 1"):
+                    resolve("cuda:1")
+        with patch.object(torch.cuda, "is_available", side_effect=AssertionError("CPU touched CUDA")):
+            self.assertEqual(H_AGENTS.resolve_training_device("cpu", allow_cpu=True), torch.device("cpu"))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA hardware required")
+    def test_real_preflight_preserves_rng_and_success_is_cached(self):
+        python_state = random.getstate()
+        numpy_state = np.random.get_state()
+        cpu_state = torch.get_rng_state().clone()
+        cuda_state = torch.cuda.get_rng_state(0).clone()
+        for resolve in self.resolvers:
+            with self.subTest(resolve=resolve):
+                with torch.inference_mode():
+                    self.assertEqual(resolve("cuda:0"), torch.device("cuda:0"))
+                self.assertEqual(random.getstate(), python_state)
+                np.testing.assert_equal(np.random.get_state(), numpy_state)
+                self.assertTrue(torch.equal(torch.get_rng_state(), cpu_state))
+                self.assertTrue(torch.equal(torch.cuda.get_rng_state(0), cuda_state))
+                with patch.object(torch, "ones", side_effect=AssertionError("Repeated CUDA probe")):
+                    resolve("cuda:0")
 
 
 if __name__ == "__main__":

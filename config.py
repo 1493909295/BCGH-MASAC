@@ -1,4 +1,6 @@
 import os
+# OPT 0.35 2000 异构 有云
+
 
 # 数据集路径
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -189,7 +191,7 @@ ENERGY_COST_WEIGHT = 0.30               #  控制 Energy objective 在联合 Rew
 
 
 # cloud 开关，false为关闭云
-ENABLE_CLOUD_ACTION = False
+ENABLE_CLOUD_ACTION = True
 
 # Neighbor Historical Feedback：COLLECT 控制是否更新历史统计，
 # USE 控制是否把历史反馈特征拼接进 Routing Actor observation。

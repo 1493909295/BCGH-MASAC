@@ -17,3 +17,28 @@ conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
 cd 
 
 conda env create -f req1.yml
+
+安装tmux
+
+apt update
+
+apt install tmux -y
+
+tmux -V
+
+tmux new -s work
+
+conda activate MYENV1
+
+
+退出xshell但不打断训练
+
+Ctrl+b
+
+d
+
+重连后查看与进入
+
+tmux ls
+
+tmux attach -t work

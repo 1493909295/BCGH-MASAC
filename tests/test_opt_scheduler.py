@@ -98,8 +98,12 @@ class ObservationTests(unittest.TestCase):
         self.assertIn("allow_cpu", str(error.exception))
 
     def test_incompatible_cuda_is_caught_before_training_and_auto_uses_cpu(self):
+        agents.resolve_training_device.cache_clear()
+        self.addCleanup(agents.resolve_training_device.cache_clear)
         with patch.object(torch.cuda, "is_available", return_value=True), \
+             patch.object(torch.cuda, "device_count", return_value=1), \
              patch.object(torch.cuda, "get_device_name", return_value="test GPU"), \
+             patch.object(torch.cuda, "get_device_capability", return_value=(7, 0)), \
              patch.object(torch, "ones", side_effect=RuntimeError("no kernel image is available")):
             with self.assertRaisesRegex(RuntimeError, "--device cpu"):
                 validate_opt_device("cuda:0")

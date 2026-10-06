@@ -437,25 +437,8 @@ class TrainingSmokeTest(unittest.TestCase):
                 metadata["bgh_guidance"]["parameters"]["guidance_lambda_stage3_end"], 0.3
             )
             self.assertEqual(metadata["saved_training_stage"], "joint_finetune")
-            records = [
-                json.loads(line)
-                for path in Path(temp).glob("*.guidance.jsonl")
-                for line in path.read_text(encoding="utf-8").splitlines()
-            ]
-            self.assertTrue(records)
-            self.assertEqual(records[-1]["guidance_lambda"], 0.3)
-            self.assertTrue(
-                any(c["resource_cost_raw"] > 0 for r in records for c in r["candidates"])
-            )
-            self.assertTrue(
-                all(
-                    "cloud_escape_probability" in c and "transit_penalty" in c
-                    for r in records
-                    for c in r["candidates"]
-                )
-            )
+            self.assertEqual(list(Path(temp).glob("*.guidance.jsonl")), [])
             self.assertEqual(len(hosts), 5)
-            self.assertTrue(any(c["source_signal"] > 0 for r in records for c in r["candidates"]))
             import csv
 
             episode_files = [p for p in Path(temp).glob("episode*.csv")]

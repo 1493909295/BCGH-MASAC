@@ -1764,7 +1764,7 @@ def train(
     train_config: TrainConfig,
     masac_config: Optional[MASACConfig] = None,
 ) -> DiscreteMASAC:
-
+    DiscreteMASAC._resolve_device(None if masac_config is None else masac_config.device)
     set_global_random_seeds(train_config.seed)
 
     # 创建初始环境

@@ -1,0 +1,1819 @@
+
+===== PDF PAGE 1 =====
+                           This article has been accepted for publication in IEEE Transactions on Services Computing. This is the author's version which has not been fully edited and
+                                                   content may change prior to final publication. Citation information: DOI 10.1109/TSC.2026.3656552
+
+                                                                                                                                                                                  1
+                 Heuristic-Guided Multi-Agent Reinforcement
+              Learning for Computing Service Scheduling in
+                                                   Distributed Data Centers
+                  Yu Zhao, Cheng Wang                ˙ID, Senior Member, IEEE, Chungang Yan, Xiaoli Li, and Changjun Jiang
+
+
+
+
+
+
+
+
+
+
+1       Abstract—With  the  rapid  growth  of  computing  services  in                        execution durations, and time-varying resource requirements          41
+
+2    distributed data centers, efﬁcient scheduling needs to consider                          [7], [8]. The internal computing resources of data centers (      e.g.,          42
+
+3    workload dynamics, resource ﬂuctuations, and diverse optimiza-                           CPU, memory, and storage) ﬂuctuate with dynamic workloads,           43
+
+4    tion  preferences  while  maintaining  service  quality  and  system
+5    efﬁciency. Multi-Agent Deep Reinforcement Learning (MADRL)                               potentially  leading  to  load  imbalance  or  resource  overload          44
+
+6    offers  a  decentralized  and  adaptive  paradigm  that  enables                         [9]. High resource utilization often results in increased en-                45
+
+7    agents  to  learn  local  scheduling  policies  aligned  with  individ-                  ergy consumption, raising operational costs and accelerating          46
+
+8    ual objectives while collectively improving global performance.                          hardware degradation [10]. Service Level Agreement (SLA)                   47
+
+9    However,  existing  MADRL  approaches  often  suffer  from  low                          is widely adopted to ensure service reliability, with any viola-          48
+
+10   sample efﬁciency and limited generalization under dynamic and
+11   heterogeneousconditions.ThispaperproposesaHeuristic-guided                               tions potentially degrading the Quality of Service (QoS) [11],                   49
+
+12   Multi-Agent  deep  Reinforcement  learning  (H-MAR)  approach                            [12]. Therefore, collaborative scheduling under such dynamic                   50
+
+13   for  computing  service  scheduling.  H-MAR  is  a  novel  multi-                        conditions, while satisfying SLA constraints, balancing load          51
+
+14   agent learning framework where heuristic functions act as struc-                         distribution, and minimizing energy consumption has become          52
+
+15   tured priors to guide personalized policy optimization, and data                         one of the key challenges.                                                                                                                  53
+
+16   augmentation is employed to enhance experience coverage and
+17   policy robustness. Moreover, we provide a modiﬁed Decentralized                             Traditional rule-based and heuristic scheduling approaches          54
+
+18   Partially  Observable  Markov  Decision  Process  (Dec-POMDP)                            cannot effectively adapt to the long-term dynamics and multi-          55
+
+19   formulation  to  support  the  theoretical  analysis  of  H-MAR.                         objective optimization demands of distributed computing en-          56
+
+20   Experiments on real-world Alibaba cluster traces show that H-                            vironments [13]–[15]. In practice, data centers often exhibit                                   57
+
+21   MAR outperforms representative baselines in the success rate                             distinct optimization preferences based on their geographical          58
+
+22   of instance creation, load balancing, and energy consumption,
+23   validating  its  effectiveness  for  adaptive  and  robust  computing                    locations, service demands, and operational scales [16], [17].                             59
+
+24   service delivery.                                                                        For  instance,  task-oriented  data  centers  prioritize  satisfying          60
+                                                                                              SLA constraints to ensure QoS, while energy-oriented data          61
+25      Index  Terms—Distributed  data  centers,  computing  service
+26   scheduling,  multi-agent  deep  reinforcement  learning,  heuristic                      centers  prioritize  reducing  energy  consumption  to  support          62
+
+27   guidance, data augmentation.                                                             sustainable operations. Such differences in optimization ob-          63
+                                                                                              jectives can lead to service priority conﬂicts in cross-regional           64
+                                                                                              collaborative  scheduling,  requiring  scheduling  decisions  to          65
+28 W                              I.  INTRODUCTION
+                                                                                              dynamically  balance  potentially  conﬂicting  objectives,  such           66
+29             ITH the rapid evolution of cloud computing and edge                            as energy efﬁciency and QoS [18]. Moreover, geographically                  67
+
+30             computing, the demand for intelligent computing ser-                           distributed data centers face variations in resource capacity          68
+
+31   vices has grown explosively [1]. Geographically distributed                              and load levels across regions and over time, further intensi-          69
+
+32   data centers have become the core infrastructure for service                             fying system heterogeneity and uncertainty in cross-regional          70
+
+33   provisioning, where heterogeneous computing resources are                                scheduling. These factors often render centralized scheduling          71
+
+34   integrated and shared to deliver stable and efﬁcient services                            policies inadequate for achieving local optimality at individual          72
+
+35   to users [2]–[4]. To sustain such ubiquitous service delivery,                           data centers and globally efﬁcient system performance.                           73
+
+36   collaborative scheduling plays a critical role in coordinating                              Recently,   Multi-Agent   Deep   Reinforcement   Learning          74
+
+37   distributed resources, improving overall resource utilization,                           (MADRL) has emerged as a promising paradigm, enabling          75
+
+38   and reducing operational costs [5], [6].                                                 decentralized  and  adaptive  scheduling  in  dynamic  environ-          76
+
+39      Computing services requested by users exhibit spatiotempo-                            ments  [19]–[21].  Through  continuous  interactions  with  the                                   77
+
+40   ral dynamics, characterized by stochastic arrival times, diverse                         environment  and  peer  agents,  multiple  agents  learn  local          78
+
+       Yu  Zhao,  Cheng  Wang,  Chungang  Yan,  and  Changjun  Jiang  are  with               policies  that  maximize  long-term  cumulative  rewards.  This          79
+     the School of Computer Science and Technology, Tongji University, Shang-                 decentralized  learning  paradigm  aligns  naturally  with  the          80
+     hai  201804,  China,  also  with  the  Key  Laboratory  of  Embedded  Sys-               distributed  architecture  of  data  centers,  allowing  agents  to          81
+     tem  and  Service  Computing,  Ministry  of  Education,  Shanghai  201804,               optimize local objectives while collectively improving global          82
+     China, and also with the Shanghai Artiﬁcial Intelligence Laboratory, Shang-
+     hai 200030, China (e-mail: jsyuzhao@tongji.edu.cn; cwang@tongji.edu.cn;                  system  performance.  However,  the  highly  dynamic  nature          83
+     yanchungang@tongji.edu.cn; cjjiang@tongji.edu.cn).                                       of  the  scheduling  environment  and  the  substantial  cost  of          84
+       Xiaoli  Li  is  with  the  School  of  Mathematics,  Yangzhou  University,             agent  interactions  often  constrain  the  diversity  of  training          85
+     Yangzhou 225002, China (e-mail: xiaoli        li9711@163.com).
+       (Corresponding authors: Changjun Jiang; Cheng Wang.)                                   experience,  thereby  reducing  the  generalization  of  learned          86
+
+
+             Authorized licensed use limited to: Inner Mongolia University. Downloaded on March 04,2026 at 10:41:44 UTC from IEEE Xplore.  Restrictions apply.
+                           © 2026 IEEE. All rights reserved, including rights for text and data mining and training of artificial intelligence and similar technologies. Personal use is permitted,
+                                            but republication/redistribution requires IEEE permission. See https://www.ieee.org/publications/rights/index.html for more information.
+
+===== PDF PAGE 2 =====
+                           This article has been accepted for publication in IEEE Transactions on Services Computing. This is the author's version which has not been fully edited and
+                                                   content may change prior to final publication. Citation information: DOI 10.1109/TSC.2026.3656552
+
+                                                                                                                                                                                 2
+
+
+
+
+
+1    models  to  unseen  workload  conditions  [22].  Furthermore,                           scheduling in distributed data centers. SectionVdiscusses the                                     59
+
+2    coordinatingcomputingservicesacrossdistributeddatacenters                               simulation results, and SectionVIconcludes the paper and                                       60
+
+3    means DRL agents need to consider various interdependent                                offers directions for future work.                                                                                              61
+
+4    factors, including workload ﬂuctuations, SLA constraints, and
+5    diverse optimization preferences [23], [24]. The intricate non-                                                     II.  RELATED WORK                                                                      62
+
+
+6    linear relationships among these factors make it difﬁcult to                                In this section, we review existing research on computing          63
+
+7    extract high-order scheduling patterns solely from historical                           service scheduling in data centers. Traditional approaches typ-          64
+
+8    interaction experience, which reduces training efﬁciency and                            ically rely on rules and heuristics that incorporate the domain          65
+
+9    convergence stability.                                                                  knowledge and predeﬁned policies to make scheduling deci-        66
+
+10      To overcome the above challenges, we propose a Heuristic-                            sions. Hung et al. [25] proposed a scheduling algorithm that                   67
+
+11   guided Multi-Agent deep Reinforcement learning (H-MAR)                                  coordinates computing services across data centers, achiev-          68
+
+12   approach for collaborative computing service scheduling in                              ing near-optimal performance with minimal communication          69
+
+13   distributed data centers. The core idea of H-MAR is a novel                             overhead. Delgado et al. [26] developed a hybrid scheduler                   70
+
+14   multi-agent learning framework that integrates heuristic guid-                          that  combines  centralized  scheduling  for  long-running  ser-          71
+
+15   ance  and  experience  augmentation  for  personalized  multi-                          vices  with  distributed  scheduling  for  short  ones,  enhanced          72
+
+16   objective  coordination,  with  a  Gap-Offset  performance  de-                         by randomized work stealing to improve runtime efﬁciency.        73
+
+17   composition. Unlike purely data-driven MADRL approaches,                                Xin  et  al.  [27]  proposed  a  weighted  random  scheduling                   74
+
+18   H-MAR models different operational preferences across data                              approach to reduce resource competition on energy-efﬁcient,        75
+
+19   centers to support personalized policy learning and employs                             low-cost devices. Anselmi [13] proposed a scalable scheduling                   76
+
+20   data  augmentation  to  improve  the  diversity  of  training  ex-                      approach  that  integrates  round  robin  and  size-interval  task          77
+
+21   perience.  In  contrast  to  heuristic  or  rule-based  schedulers,                     assignments  to  achieve  load  balancing  in  distributed  data          78
+
+22   heuristicsinH-MARarenottreatedasﬁxeddecisionrules,but                                   centers.  Gao  et  al.  [15]  proposed  the  Distributed  Shortest                   79
+
+23   are incorporated as structured priors into policy optimization.                         Remaining Time First (DSRTF) scheduling approach, which          80
+
+24   From a Decentralized Partially Observable Markov Decision                               minimizes job completion time by jointly considering band-          81
+
+25   Process (Dec-POMDP) perspective, we establish a modiﬁed                                 width availability and task priority. Li et al. [28] proposed                   82
+
+26   formulation. Under this formulation, the performance loss on                            a heuristic scheduling approach that incorporates application          83
+
+27   the original problem can be decomposed into a training Gap                              sorting,  deadline  partitioning,  and  task  ordering  policies  to          84
+
+28   term and a reformulation Offset  term, providing theoretical                            minimize electricity costs in distributed data centers. Zhang          85
+
+29   insights into the convergence behavior and robustness of H-                             et al. [29] proposed an initial virtual machine fault-tolerant                   86
+
+30   MAR. The main contributions of this paper are summarized                                placement model based on a heuristic ant colony approach          87
+
+31   as follows.                                                                             to address reliability issues in star topological data centers.          88
+
+32      •  We formulate computing service scheduling in distributed                          Tang et al. [30] designed a heuristic greedy job scheduling                   89
+
+33         data centers as a personalized multi-objective optimiza-                          approach to minimize execution costs by considering ﬁle data        90
+
+34         tion problem. Each data center is equipped with a DRL                             reading and writing in global virtual storage systems. These          91
+
+35         agent that manages multiple computing services based                              works typically assume a static environment with predeﬁned        92
+
+36         on  dynamic,  multidimensional  resource  states  and  its                        system conditions and load characteristics, which limits their          93
+
+37         optimization preferences.                                                         adaptability  to  dynamic  and  heterogeneous  distributed  data          94
+
+38      •  We propose the H-MAR approach for collaborative ser-                              centers that require long-term optimization.                                                               95
+
+39         vice scheduling, which integrates heuristic functions as                              Related efforts have explored learning-based optimization          96
+
+40         structuredpriorsandadoptsdataaugmentationtoenhance                                from different perspectives. For instance, multi-objective re-          97
+
+41         experiencecoverage,therebyimprovingsampleefﬁciency                                inforcement learning theoretically handles preference trade-          98
+
+42         and guiding multi-agent policy optimization. Each agent                           offs [31], graph representation learning optimizes end-to-end                   99
+
+43         learns a personalized scheduling policy and coordinates                           programmable computing systems [32], and structure-aware                 100
+
+44         with other agents to achieve effective trade-offs between                         reinforcement learning addresses device placement on compu-        101
+
+45         local objectives and global system performance. Addi-                             tational graphs [33]. However, these approaches do not specif-                 102
+
+46         tionally, we provide a modiﬁed Dec-POMDP formulation                              ically model the computing service scheduling problem as an        103
+
+47         to support the theoretical analysis of H-MAR.                                     online, closed-loop decision process within high-dimensional        104
+
+48      •  We conduct experiments based on real-world production                             state and action spaces under strict SLA constraints. Many        105
+
+49         trace data from Alibaba clusters. These results show that                         studies have employed learning-based approaches to address        106
+
+50         H-MAR  improves  convergence  speed  and  outperforms                             this speciﬁc scheduling challenge. Maoet al. [34] proposed                 107
+
+51         representative  scheduling  approaches  in  terms  of  load                       DeepRM, a DRL-based approach that allocates computing re-        108
+
+52         balancing, energy consumption, and QoS, demonstrating                             sources to incoming jobs with the goal of minimizing latency.        109
+
+53         its potential and advantages in practical distributed data                        Cheng et al. [35] presented H     2O-Cloud, a Hierarchical and        110
+
+54         center environments.                                                              Hybrid Online task scheduling framework for warehouse-scale        111
+
+55      The remainder of this paper is organized as follows. Section                         Cloud service providers, which leverages DRL to optimize        112
+
+56   IIreviews the related work. SectionIIIprovides the system                               resource utilization and energy cost while maintaining QoS.        113
+
+57   model and formulates the scheduling problem. SectionIVin-                               Mondal et al. [7] proposed a DRL-based approach that utilizes              114
+
+58   troducestheproposedH-MARapproachforcomputingservice                                     various time-varying resource usage patterns of workloads to        115
+
+
+             Authorized licensed use limited to: Inner Mongolia University. Downloaded on March 04,2026 at 10:41:44 UTC from IEEE Xplore.  Restrictions apply.
+                           © 2026 IEEE. All rights reserved, including rights for text and data mining and training of artificial intelligence and similar technologies. Personal use is permitted,
+                                            but republication/redistribution requires IEEE permission. See https://www.ieee.org/publications/rights/index.html for more information.
+
+===== PDF PAGE 3 =====
+                            This article has been accepted for publication in IEEE Transactions on Services Computing. This is the author's version which has not been fully edited and
+                                                    content may change prior to final publication. Citation information: DOI 10.1109/TSC.2026.3656552
+
+                                                                                                                                                                                     3
+
+
+
+                                                                                        TABLE I
+                                                    COMPARISON OF RELATED WORKS ABOUT SCHEDULING APPROACHES
+            Reference                                Objectives                                Rule/Heuristic-Based     Learning-Based     Collaboration     Solving Approach
+                [25]                               Completion time                             ✓        ×                ✓                         Greedy
+                [27]                            Execution time, cost                           ✓        ×      ×                Weighted Random
+                [13]                                 Load balancing                              ✓        ×      ×                    Round Robin
+                [30]                                 Execution cost                              ✓        ×      ×                         Greedy
+                [35]              Energy efﬁciency, resource utilization       ×                    ✓      ×                  Deep Q-learning
+                [37]           Resource utilization, resource availability      ×                    ✓      ×                            NES[7]                   Waiting time, resource utilization       ×                    ✓      ×                    REINFORCE
+                [38]                        Energy consumption, cost         ×                    ✓      ×                       Q-learning
+                [39]                               Completion time           ×                    ✓                ✓                         MAAC[8]             Load balancing, SRIC, completion time      ×                    ✓      ×                 Distributed DQN
+                [40]                            Energy consumption          ×                    ✓                ✓                         MAAC
+                [41]           Completion number, energy consumption      ×                    ✓                ✓                        MAPPO[5]                System revenue, completion number       ×                    ✓                ✓                       MADDPG
+            Proposed      SRIC, load balancing, energy consumption             ✓                    ✓                ✓                         H-MAR[42]                                   Energy Cost            ×                    ✓                ✓                            FRL
+
+
+
+
+1    improve waiting times and resource utilization. Zeng et al.
+
+2    [36]  designed  an  ADaptive  Virtual  Machine  Consolidation
+
+3    (ADVMC) framework based on Deep Q-Network (DQN) to
+
+4    reduce energy consumption and SLA conﬂicts in an energy-
+
+5    efﬁcient cloud data center. Weiet al. [37] proposed a multi-
+
+6    dimensional  resource  allocation  approach  based  on  Natural
+
+7    Evolution Strategies (NES), which enables balanced resource
+
+8    utilization  and  availability  in  dynamic  data  center  environ-
+
+9    ments. Ma et al. [38] proposed a dynamic resource consoli-
+
+10   dation approach based on Q-learning to determine the optimal
+
+11   parallel allocation order for multiple virtual machines, jointly
+
+12   optimizing energy consumption and costs. Li et al. [8] pro-
+                                                                                                Fig. 1.  System model for collaborative scheduling in distributed data centers.
+13   posed a dynamic load balancing scheduling algorithm based
+
+14   ondistributedDQNtojointlyoptimizeloadbalancing,Success                                     heterogeneous  environments  while  ensuring  the  operational          45
+
+15   Rate of Instance Creation (SRIC), and completion time. These                               privacy of cloud service providers.                                                                                         46
+
+16   learning-based scheduling approaches are typically built upon                                 We summarize and compare the main related scheduling          47
+
+17   a centralized control architecture, which aligns with traditional                          approaches  in  TableI.  Traditional  rule-based  and  heuristic                        48
+
+18   cloud computing paradigms. However, they may face chal-                                    approaches suffer from limited adaptability in dynamic en-          49
+
+19   lenges  when  applied  in  heterogeneous  and  distributed  data                           vironments, while learning-based approaches are constrained          50
+
+20   center environments characterized by decentralized resources,                              by insufﬁcient training data and limited capability to capture        51
+
+21   dynamic workloads, and diverse operational objectives.                                     complex scheduling factors. These limitations motivate a more          52
+                                                                                                adaptive and robust approach to support efﬁcient computing        53
+22      Recently, many researchers have employed MADRL, lever-
+                                                                                                service scheduling in geographically distributed data centers.            54
+23   aging  interactions  among  multiple  DRL  agents  to  enhance
+
+24   adaptability  in  dynamic  and  decentralized  scheduling  sce-                                 III.  SYSTEM MODEL AND PROBLEM FORMULATION                     55
+
+25   narios. Zhao et al. [39] proposed a ﬁne-grained scheduling
+                                                                                                   In  this  section,  we  ﬁrst  present  the  system  model  for        56
+26   approach  based  on  Multi-Agent  Actor-Critic  (MAAC)  that
+                                                                                                collaborative computing service scheduling in distributed data          57
+27   utilizes collaborative learning to reduce task completion time.
+                                                                                                centers. Then, we propose the scheduling model and formulate          58
+28   Huang et al. [43] designed a MADRL-based incentive mech-
+                                                                                                a personalized multi-objective optimization problem.                                    59
+29   anism to promote cooperation and resource sharing among
+
+30   service providers. Lang et al. [44] proposed a MADRL-based
+
+31   online scheduling approach that considers data locality and                                A. System Model                                                                                                                                            60
+
+32   deadline constraints to optimize energy consumption. Jayanetti                                As shown in Fig.1, we design a system model that logically                         61
+
+33   et  al.  [40]  developed  a  collaborative  MADRL  scheduling                              aggregates  multiple  geographically  distributed  data  centers          62
+
+34   framework to optimize green energy utilization across multiple                             to collaboratively deliver computing services. Let the set of          63
+
+35   data  centers.  Wang  et  al.  [41]  proposed  an  intent-driven                           data  centers  be  denoted  as D  = {DC1,DC2,...,DCN},          64
+
+36   intelligent scheduling approach based on Multi-Agent Prox-                                 whereN  is  the  number  of  data  centers.  Following  [45],                   65
+
+37   imal Policy Optimization (MAPPO) to balance time-sensitive                                 [46],  the  system  operates  in  discrete  time  slots,  with  the                   66
+
+38   demands with infrastructure energy consumption. Ma et al.                                  scheduling  horizon T   =  {1,2,...,T}.  Within  each  data          67
+
+39   [5]combined Multi-AgentDeepDeterministic PolicyGradient                                    centerDCn,  servers  are  virtualized  into  virtual  machines,          68
+
+40   (MADDPG) with convex optimization for task decomposition                                   which are dynamically provisioned according to service de-          69
+
+41   and path planning to maximize system revenue and reduce                                    mands. The set of virtual machines inDCn  is denoted as          70
+
+42   completiontime.Sunetal.[42]presentedaprivacy-preserving                                    Vn ={VMn1,VMn2,...,VMnV}, whereV  is the number of          71
+
+43   Federated Reinforcement Learning (FRL) approach for col-                                   virtual machines. The resource attributes ofVMnv  are its CPU,          72
+
+44   laborative scheduling, which facilitates energy sharing across                             memory, network bandwidth, and I/O throughput capacities,          73
+
+
+              Authorized licensed use limited to: Inner Mongolia University. Downloaded on March 04,2026 at 10:41:44 UTC from IEEE Xplore.  Restrictions apply.
+                            © 2026 IEEE. All rights reserved, including rights for text and data mining and training of artificial intelligence and similar technologies. Personal use is permitted,
+                                             but republication/redistribution requires IEEE permission. See https://www.ieee.org/publications/rights/index.html for more information.
+
+===== PDF PAGE 4 =====
+                             This article has been accepted for publication in IEEE Transactions on Services Computing. This is the author's version which has not been fully edited and
+                                                      content may change prior to final publication. Citation information: DOI 10.1109/TSC.2026.3656552
+
+                                                                                                                                                                                          4
+
+
+
+                                            TABLE II                                              B. Scheduling Model                                                                                                                                 32
+                                  LIST OF MAIN NOTATIONS                                              At each time slott, the local agentn generates a scheduling          33
+       Notation                                      Description
+       DCn,N,D                        n-th data center, number and set of dis-                    policy and outputs a signal. This signal is used to select a          34
+                                           tributed data centers                                  virtual machine for instance creation in the local data center          35
+       t,T,T                                         Index, number, and set of time slots         or  across  other  data  centers,  aiming  to  enhance  stability,          36
+       VMnv,V,Vn                      v-th  virtual  machine,  number  and  set  of
+                                           virtual machines in DCn                                sustainability, and QoS in distributed data centers.                                           37
+       Cpunv,Memnv,Bandnv,                 CPU, memory, network bandwidth, and                        1) Instance  Creation:  If  the  scheduling  signal  indicates          38
+       IOnv                                I/O throughput capacities of VMnv
+       Jobnj (t),J,Jn(t)               j-th job, number and set of jobs in DCn                    local processing, the agentn inDCn  veriﬁes whether the        39
+                                           at time slot t                                         selected virtual machine satisﬁes the resource demands for        40
+       Tasknj,i(t),I,Knj (t)            i-th task, number and set of tasks within
+                                           Jobnj (t) at time slot t                               creating  instance Insnj,i,m(t)  under  the  SLA  constraints.          41
+       Insnj,i,m(t),M,Inj,i(t)         m-th instance, number and set of instances                 Speciﬁcally, letCpunj,i,m(t),Memnj,i,m(t),Bandnj,i,m(t), and          42
+                                           within Tasknj,i(t) at time slot t                      IOnj,i,m(t) denote the CPU, memory, bandwidth, and I/O de-          43
+       Cpunj,i,m(t),Memnj,i,m(t),          CPU, memory, bandwidth, and I/O dema-
+       Bandnj,i,m(t),IOnj,i,m(t)           nds of Insnj,i,m(t)                                    mands ofInsnj,i,m(t), respectively. The available resources on          44
+       Cpun,Avlv         (t),Memn,Avlv         (t),Available CPU, memory, bandwidth, and          the selectedVMnv  at time slott are denoted asCpun,Avlv      (t),          45
+       Bandn,Avlv         (t),IOn,Avlv         (t)I/O resources of VMnv  at time slot t           Memn,Avlv      (t),Bandn,Avlv      (t), andIOn,Avlv      (t). Agentn con-          46
+       ICnj,i,m(t)                                Instance creation indicator of Insnj,i,m(t)     ﬁrms the feasibility of instance creation by verifying whether        47
+       SRn(t),LBn(t),ECn(t)      SRIC, overall load balancing degree, and                         the selectedVMnv  satisﬁes the following conditions:                                  48
+                                           energy consumption inDCn at time slott                                          
+       LBnCpu(t),LBnMem(t)           CPU and memory load balancing degrees                                                          Cpunj,i,m(t)≤Cpun,Avlv      (t),
+                                           in DCn at time slot t
+       LCn,Avg(t),LMn,Avg(t)     Average CPU and memory loads in DCn                                                                Memnj,i,m(t)≤Memn,Avlv      (t),
+                                           at time slot t                                                                     1,
+       LCnv (t),LMnv (t)                     CPU and memory loads ofVMnv  inDCn                        ICnj,i,m(t) =                Bandnj,i,m(t)≤Bandn,Avlv      (t),                 (1)
+                                           at time slot t                                                                  
+       Pidle,Pfull                              Power consumption of a virtual machine at                                           IOnj,i,m(t)≤IOn,Avlv      (t),
+                                           idle and full loads
+       wn1,wn2,wn3                               Weighting factors of SRIC, load balancing,                                   0,    otherwise.
+                                           and energy consumption
+                                                                                                      If the SLA constraints are violated, the instance creation          5049
+
+
+1    denoted  asCpunv,Memnv,Bandnv,  andIOnv,  respectively.                                      fails and the agentn reports a rejection signal to the user          51
+
+2    Computing service requests are abstracted into structured jobs                               through the system feedback mechanisms. Conversely, if the          52
+
+3    for  efﬁcient  scheduling  and  execution.  At  each  time  slot                             SLA  constraints  are  satisﬁed,  the  selectedVMnv   inDCn          53
+
+4    t ∈ T , a set of jobs arrives atDCn, denoted as Jn(t) =                                      successfully  creates  the  instance.  If  the  scheduling  signal          54
+
+5    {Jobn1(t),Jobn2(t),...,JobnJ(t)},  where J   is  the  number                                 indicates scheduling instances across data centers, the agentn          55
+
+6    of  jobs.  Each  jobJobnj(t)  comprises  multiple  tasks,  de-                               assignsInsnj,i,m(t) to another data center with sufﬁcient com-        56
+
+7    noted as Knj(t) = {Tasknj,1(t),Tasknj,2(t),...,Tasknj,I(t)},                                 puting resources.The deﬁnition ofICnj,i,m(t) in thealternative          57
+
+8    whereI  is the number of tasks withinJobnj(t). Each task                                     data center follows the same criteria as local processing. To          58
+
+9    Tasknj,i(t) is further divided into multiple instances, denoted                              evaluatetheefﬁciencyoftheinstancecreationprocess,SRICis        59
+
+10   as Inj,i(t) ={Insnj,i,1(t),Insnj,i,2(t),...,Insnj,i,M(t)}, where                             introduced as a key performance metric. A higher SRIC value          60
+
+11   M is the number of instances withinTasknj,i(t). This three-                                  indicates better resource allocation efﬁciency and contributes        61
+
+12   level structure of jobs, tasks, and instances is consistent with                             to improved QoS. The SRIC inDCn is deﬁned as:                                     62
+
+13   the  workload  abstractions  used  in  production  cluster  man-                                                           ∑J       ∑I        ∑M
+                                                                                                                SRn(t) =            j=1      i=1      m=1ICnj,i,m(t)
+14   agement systems [47], [48]. For better perception, the main                                                                       ∑J       ∑I       ∑M
+
+15   notations are summarized in TableII. To optimize computing                                                                           j=1       i=1      m=11   ,          (2)
+
+16   service execution, each data center is equipped with a local
+                                                                                                  where the denominator is the total number of instances to          63
+17   scheduling  agent.  These  agents  operate  in  a  decentralized
+                                                                                                  be  scheduled  inDCn  at  time  slott.  When  the  instance          64
+18   manner, making decisions based on local resource states while
+                                                                                                  is  successfully  created,DCn  returns  the  instance  creation          65
+19   coordinating with other agents to achieve global objectives.
+                                                                                                  information of the service request to the user. Meanwhile, the          66
+20   The key functions of each agent include:
+                                                                                                  load on the virtual machine is updated, which affects the load          67
+21       1) Resource Monitoring: Continuously monitor and collect                                 balancing and energy consumption of the data center hosting          68
+
+22   real-time information withinDCn, including the resource load                                 the virtual machine.                                                                                                                                    69
+
+23   of its virtual machines and the attributes of newly arrived jobs.
+                                                                                                      2) Load Balancing: The load balancing degrees of comput-          70
+24       2) Task Allocation: Automatically allocate task instances to                             ing resources inDCn are quantiﬁed using the standard devia-        71
+
+25   appropriate virtual machines based on resource demands, SLA                                  tion of CPU and memory loads across all virtual machines.          72
+
+26   constraints, and real-time resource availability withinDCn.                                  CPU  and  memory  are  considered  because  they  represent          73
+
+
+27       3) Collaborative Interaction: When local resources are in-                               the  primary  long-term  contention  resources  in  data  center          74
+
+28   sufﬁcient or load imbalances arise across data centers, collab-                              scheduling.  A  higher  standard  deviation  indicates  a  more          75
+
+29   orate with other agents to assign task instances to less-loaded                              unbalanced load distribution, while a lower value indicates          76
+
+30   data  centers.  Interaction  between  agents  is  assumed  to  be                            a more balanced load. The CPU and memory load balancing          77
+
+31   reliable, ensuring consistent scheduling information exchange.                               degrees inDCn are deﬁned as follows.                                                                        78
+
+
+              Authorized licensed use limited to: Inner Mongolia University. Downloaded on March 04,2026 at 10:41:44 UTC from IEEE Xplore.  Restrictions apply.
+                             © 2026 IEEE. All rights reserved, including rights for text and data mining and training of artificial intelligence and similar technologies. Personal use is permitted,
+                                              but republication/redistribution requires IEEE permission. See https://www.ieee.org/publications/rights/index.html for more information.
+
+===== PDF PAGE 5 =====
+                            This article has been accepted for publication in IEEE Transactions on Services Computing. This is the author's version which has not been fully edited and
+                                                   content may change prior to final publication. Citation information: DOI 10.1109/TSC.2026.3656552
+
+                                                                                                                                                                                  5
+
+
+
+
+
+1           a) CPU Load Balancing:  The CPU load balancing de-                                balancing, and energy consumption to jointly enhance overall          36
+
+2    gree inDCn at time slott is deﬁned as:                                                   system performance. The optimization objective inDCn  is          37
+                               √                                                           deﬁned as:                                                                                                                                                              38
+                                    1   V∑  (                                 )2,    (3)
+             LBnCpu(t) =           V          LCnv(t)−LCn,Avg(t)                                             T∑ (−wn1×SRn(t)+wn2×LBn(t)+wn3×ECn(t)),
+                                       v=1                                                    Fn = 1
+                                                                                                        T  t=1
+
+3    whereLCnv(t) is the CPU load ofVMnv  inDCn at time slot                                                                                                                  (10)
+
+4    t, deﬁned as:                                                                            wherewn1,wn2, andwn3 are the non-negative weighting factors          39
+                        LCnv(t) =Cpunv −Cpun,Avlv      (t)                                    of SRIC, load balancing, and energy consumption, satisfying          40
+                                                   Cpunv     ,                  (4)           wn1 +wn2 +wn3  = 1. We adopt a domain-driven weighting          41
+                                                                                              strategy in which the dominant operational objective of each          42
+5    andLCn,Avg(t)in(3)istheaverageCPUloadin DCn attime                                       data center type determines its relative weight in the multi-          43
+                                                                     ∑V
+6    slott, which is calculated asLCn,Avg(t) =  1V                       v=1LCnv(t).          objective formulation. This follows common practice in data          44
+
+7           b) Memory Load Balancing: Similarly, the memory load                              center scheduling, where weights encode operator priorities          45
+
+8    balancing degree inDCn at time slott is deﬁned as:                                       rather  than  being  ﬁnely  tuned  for  mathematical  optimality.        46
+                             √
+                                  1   V∑  (                                  )2,     (5)      The overall optimization problem integrates the personalized          47
+         LBnMem(t) =             V          LMnv(t)−LMn,Avg(t)                                objectives of individual data centers into a global collaborative          48
+                                     v=1                                                      scheduling objective, formulated as follows:                                                             49
+
+9    whereLMnv(t) is the memory load ofVMnv  inDCn at time                                                                                N∑
+
+10   slott, deﬁned as:                                                                                                        min 1            Fn,                              (11)
+                                                                                                                                     N   n=1
+                      LMnv(t) =Memnv −Memn,Avlv      (t)Memnv     ,               (6)         s.t.
+
+
+
+11   and LMn,Avg(t)  in  (5)  is  the  average  memory  load  in                                         Cpunj,i,m(t)≤Cpun,Avlv      (t),
+
+12   DCn  at time slott, which is calculated asLMn,Avg(t) =
+      1 ∑V                                                                                               Memnj,i,m(t)≤Memn,Avlv      (t),
+13   V      v=1LMnv(t). The overall load balancing degree inDCn
+
+14   at time slott is deﬁned as:                                                                         Bandnj,i,m(t)≤Bandn,Avlv      (t),
+                                   V∑  (⏐⏐LCnv(t)−LCn,Avg(t)⏐⏐                                           IOnj,i,m(t)≤IOn,Avlv      (t),   ∀n,v,j,i,m,            (11a)
+                   LBn(t) =                                                           (7)                  N∑   V∑
+                                  v=1
+                                  +⏐⏐LMnv(t)−LMn,Avg(t)⏐⏐).                                                         ICnj,i,m(t)≤ 1,   ∀n,v,j,i,m,              (11b)
+                                                                                                         n=1   v=1
+
+15      3) Energy Consumption:  The energy consumption of each
+16   data center primarily depends on the CPU load of its virtual                             where (11a) ensures that the resource demands of   Insnj,i,m(t)          50
+                                                                                              do not exceed the available resources of the assignedVMnv ,          51
+17   machines [49]. A higher CPU load increases energy consump-
+                                                                                              and (11b) guarantees that each instance is assigned to at most                       52
+18   tion, while a lower CPU load reduces energy consumption.
+                                                                                              onevirtualmachineacrossalldatacenters.Themulti-objective          53
+19   For simplicity, the energy consumption of virtual machines
+                                                                                              optimization problem is challenging due to its non-convexity,          54
+20   can be directly estimated based on their CPU load. Under this
+                                                                                              long-term dynamic nature, and the need to balance multiple          55
+21   assumption, the energy consumption ofVMnv  inDCn at time
+                                                                                              conﬂicting objectives. Traditional scheduling approaches can-           56
+22   slott is deﬁned as:
+                ECnv(t) =Pidle+(Pfull−Pidle)×LCnv(t),        (8)                              not adapt to changing conditions, often resulting in suboptimal          57
+                                                                                              scheduling policies. To address these challenges, we introduce          58
+
+23   wherePidle is the power consumption of a virtual machine                                 a MADRL framework, where each local agent autonomously          59
+
+24   under an idle load, andPfull  is the power consumption of                                learns and optimizes its policy through continuous interactions          60
+
+25   a virtual machine under a full load. Then, the total energy                              with the environment and other agents. This allows the system          61
+
+26   consumption inDCn at time slott is given by:                                             to achieve more adaptive computing resource allocation and          62
+                                                V∑                                            efﬁcient trade-offs among multiple objectives.                                                      63
+                               ECn(t) =             ECnv(t).                          (9)
+                                               v=1                                                      IV.  HEURISTIC-GUIDED MULTI-AGENT DEEP                              64
+                                                                                                            REINFORCEMENT LEARNING APPROACH                                      65
+
+27   C. Problem Formulation
+                                                                                                  In  this  section,  we  introduce  the  proposed  H-MAR  ap-          66
+28      Due to differences in geographical location, business de-
+                                                                                              proach. First, we formulate the collaborative computing ser-          67
+29   mands, and operational scale, data centers exhibit signiﬁcant
+                                                                                              vice scheduling problem of local agents as a Dec-POMDP.          68
+30   variations in hardware conﬁgurations, operational costs, and
+                                                                                              Second,  we  propose  a  heuristic-guided  learning  algorithm          69
+31   SLA  constraints.  This  heterogeneity  results  in  diverse  op-
+                                                                                              integrating  data  augmentation  and  heuristic  functions  into          70
+32   timization  preferences,  making  a  uniﬁed  scheduling  policy
+                                                                                              the  MADRL  framework.  Third,  we  adopt  the  Multi-Agent          71
+33   inadequate for all data centers. Therefore, we design a person-
+                                                                                              Discrete Soft Actor-Critic (MADSAC) algorithm for policy          72
+34   alized multi-objective optimization for each data center, where
+                                                                                              learning.  Finally,  we  provide  a  theoretical  analysis  of  the          73
+35   differentiated scheduling weights are assigned to SRIC, load
+                                                                                              proposed approach.                                                                                                                                      74
+
+              Authorized licensed use limited to: Inner Mongolia University. Downloaded on March 04,2026 at 10:41:44 UTC from IEEE Xplore.  Restrictions apply.
+                            © 2026 IEEE. All rights reserved, including rights for text and data mining and training of artificial intelligence and similar technologies. Personal use is permitted,
+                                             but republication/redistribution requires IEEE permission. See https://www.ieee.org/publications/rights/index.html for more information.
+
+===== PDF PAGE 6 =====
+                           This article has been accepted for publication in IEEE Transactions on Services Computing. This is the author's version which has not been fully edited and
+                                                 content may change prior to final publication. Citation information: DOI 10.1109/TSC.2026.3656552
+
+                                                                                                                                                                            6
+
+
+                                                                                           the instance to another data center (e.g., one with a lower          43
+                                                                                           average  load).  The  action  space  of  agentn  is  deﬁned  as        44
+                                                                                           an(t)∈{1,2,...,V,V +1,...,V +N−1}, where indices 1          45
+                                                                                           toV  correspond to the virtual machines inDCn, and indices          46
+                                                                                           V +1 toV +N−1 denote the other data centers to which the          47
+                                                                                           instancecanbescheduled.Thejointactionofallagentsattime          48
+                                                                                           slott is given bya(t) =[a1(t),a2(t),...,an(t),...,aN(t)].          49
+                                                                                              3) Reward Function:  To balance the scheduling demands          50
+                                                                                           of  different  data  centers  and  jointly  optimize  SRIC,  load          51
+                                                                                           balancing, and energy consumption, we design a personalized          52
+     Fig. 2.   The interaction process between agents and the environment in the           reward function for each agent. At time slott, the reward of          53
+     MADRL framework.                                                                      agentn consists of three components.                                                                               54
+                                                                                                 a) SRIC Reward:  The SRIC reward evaluates whether          55
+1    A. Dec-POMDP
+                                                                                           the scheduling action complies with SLA constraints:                                 56
+2       The collaborative scheduling process is modeled as a Dec-                                                        
+
+3    POMDP [50], deﬁned by    M = (O,A,R,P,α). Speciﬁcally,                                                                 −1,    SLA violated,
+
+4    O = ∏Nn=1On represents the joint observation space of all                                              rnSR(t) =       1,       local execution,                   (13)
+                                                                                                                         
+5    agents, whereOn denotes the local observation space of agent                                                           0.5,    remote execution,
+
+6    n, capturing the partial information about the environment.
+7    A =∏N                                                                                 where  the  value  0.5  is  chosen  as  an  intermediate  reward          57
+               n=1An denotes the joint action space, where An is                           to reﬂect that remote execution is less desirable than local           58
+8    the action space of agentn.R is the reward function, and
+                                                                                           execution, but still preferable to an SLA violation. This design          59
+9    P  is the transition function. The discount factorα ∈ [0,1)
+                                                                                           is intended to implicitly capture the additional overheads of          60
+10   determines the importance of future rewards. The observation
+                                                                                           execution  across  data  centers,  including  migration  latency,          61
+11   space,actionspace,andrewardfunctionaredeﬁnedasfollows.
+                                                                                           extra  energy  usage,  and  increased  coordination  uncertainty,          62
+12      1) Observation Space: Although virtual machines and task
+                                                                                           while keeping the reward shaping stable for policy learning.             63
+13   instances  involve  multiple  resource  dimensions  in  system
+                                                                                                 b) Load Balancing Reward:  Since each agent can only          64
+14   modeling,thefeasibilityofexecutinginstancesincollaborative
+                                                                                           observe the load information of virtual machines within its          65
+15   scheduling is often bottlenecked by computing resources. In
+                                                                                           own data center, load balancing is evaluated whenInsnj,i,m(t)          66
+16   particular, CPU and memory availability are the key factors
+                                                                                           is executed locally. Agentn measures the deviation between          67
+17   in determining whether an instance can be placed on a given
+                                                                                           the selectedVMnv  and the average load ofDCn:                                            68
+18   virtual machine at each decision slot [48]. Accordingly, our
+
+19   observation space focuses on CPU and memory as the core                                                DCnv(t) =LCn,Avg(t)−LCnv(t),
+
+20   state variables that govern the per-slot scheduling decisions.                                        DMnv(t) =LMn,Avg(t)−LMnv(t).             (14)
+
+21   For agentn, the local observation space includes the load in-
+                                                                                              The load balancing reward of agentn is deﬁned as follows:        69
+22   formation ofDCn and details of the task instanceInsnj,i,m(t)                                       
+                                                                                                                                           local execution,
+23   within the current jobJobnj(t). The load information of the
+                                                                                                           1,                              DCnv(t)≥,DMnv(t)≥ 0,
+24   local  observation, denoted  ason1(t),  includes the  CPU and
+                                                                                           rnLB(t) =        DCnv(t)+DMnv(t)
+25   memory loads of all virtual machines inDCn, as well as                                             
+                                                                                                                        2      ,    local execution, otherwise,
+26   the average CPU and memory loads across all data centers:
+                                                                                                           0,                                   remote execution.
+     on1(t) = [LCn1(t),LMn1(t),...,LCnV(t),LMnV(t),                                                                                                                     (15)
+         LC1,Avg(t),LM1,Avg(t),...,LCN,Avg(t),LMN,Avg(t)].                                 consumption reward is computed only for local execution:                   71c) Energy Consumption Reward:  Similarly, the energy          70
+                                                                                 (12)                           
+
+27      Each agent periodically shares the average load information
+                                                                                                                   −ECn(t)
+28   of  its  local  data  center  with  other  agents.  This  exchange                           rnEC(t) =           Pfull×V,    local execution,                      (16)
+29   involvesonlyaggregatedstatistics,resultinginminimalsystem                                                  
+                                                                                                                   0,                      remote execution,
+30   overhead, while enabling partial global visibility for agents to
+31   assess the overall system state and identify potential resource                       whereECn(t) is the energy consumption ofDCn at time slot          72
+
+32   imbalances. Such information sharing facilitates more efﬁcient                        t, as deﬁned in (9). By combining the three components, the              73
+
+33   and balanced scheduling decisions across the system.                                  personalized reward of agentn at time slott is deﬁned as:               74
+
+
+34      In addition, the instance information of the observation at                          rn(t) =wn1 ×rnSR(t)+wn2 ×rnLB(t)+wn3 ×rnEC(t).  (17)
+
+35   time slott ison2(t) = [m,Cpunj,i,m(t),Memnj,i,m(t)], where
+                                                                                           wherewn1,wn2, andwn3 are the same weighting factors deﬁned        75
+36   m is the index ofInsnj,i,m(t) withinTasknj,i(t) of current
+                                                                                           in  (10). The  overall  reward for  collaborative scheduling  in                   76∑N
+37   Jobnj(t). The local observation of agentn at time slott is
+                                                                                           distributed data centers at time slott isr(t) =  1N                  n=1rn(t).          77
+38   on(t) = [on1(t),on2(t)], and the joint observation of all agents
+                                                                                              During the MADRL training process, the system aims to          78
+39   in the system iso(t) =[o1(t),o2(t),...,on(t),...,oN(t)].
+                                                                                           maximize the expected cumulative discounted reward:                               79
+40      2) Action Space:  At each time slot, agentn decides the                                                            (∞∑                    )
+
+41   execution location ofInsnj,i,m(t), either by selecting a virtual
+                                                                                                                 J =E             αt−1×r(t)          .                     (18)
+42   machine within its own data centerDCn  or by ofﬂoading
+                                                                                                                             t=1
+
+             Authorized licensed use limited to: Inner Mongolia University. Downloaded on March 04,2026 at 10:41:44 UTC from IEEE Xplore.  Restrictions apply.
+                           © 2026 IEEE. All rights reserved, including rights for text and data mining and training of artificial intelligence and similar technologies. Personal use is permitted,
+                                           but republication/redistribution requires IEEE permission. See https://www.ieee.org/publications/rights/index.html for more information.
+
+===== PDF PAGE 7 =====
+                           This article has been accepted for publication in IEEE Transactions on Services Computing. This is the author's version which has not been fully edited and
+                                                   content may change prior to final publication. Citation information: DOI 10.1109/TSC.2026.3656552
+
+                                                                                                                                                                                7
+
+
+
+
+
+1       The interaction between agents and the environment in the                            scheduling  objectives  of  instance  creation,  load  balancing,          56
+
+2    MADRL framework is shown in Fig.2. At each time slot                                    and energy consumption into one-step evaluable terms. This          57
+
+3    t, agentn receives a local observationon(t) from the envi-                              construction  allows  the  personalized  reward  to  incorporate          58
+
+4    ronment. Based on its policyµn, the agent selects an action                             structured prior knowledge that pure MADRL training cannot          59
+
+5    an(t).Theenvironmentthentransitionstothenextobservation                                 efﬁciently capture.                                                                                                                                       60
+
+6    on(t+1) based on the transition probability functionP, and                                 Agentn  extracts  the  augmented  CPU and  memory  load          61
+
+7    the agent receives a personalized rewardrn(t). These inter-                             information of all virtual machines inDCn  from ¯on′b . The          62
+
+8    actions form transition tuples (on(t),an(t),rn(t),on(t+1)),                             localsuccessscoreoftheschedulingprocessisevaluatedaskV ,          63
+
+9    whicharestoredintheagent’sreplaybufferBn.Forsimplicity,                                 wherek is the number of virtual machines inDCn that satisfy          64
+
+10   each tuple is denoted as (ont,ant,rnt,on′t ).                                           SLA constraints based on the augmented instance demands.          65
+                                                                                             This measure is based on the fundamental feasibility principle          66
+
+11   B. Heuristic-Guided Learning Algorithm                                                  in resource scheduling, which states that a new instance can          67
+
+12      Purely  MADRL-based  scheduling  approaches  face  chal-                             only be placed on virtual machines whose available resources          68
+
+13   lenges in highly dynamic and uncertain environments. Limited                            satisfy its demands [48]. To reﬂect the global resource avail-                     69
+
+14   training data can lead to low sample efﬁciency and unstable                             ability, the cross-agent success score is deﬁned as:                                        70
+
+15   policy convergence. In addition, the absence of prior knowl-
+                                                                                                    δnb =                              1∑N(                       ),       (20)
+16   edge makes it difﬁcult for agents to capture latent scheduling                                         1+ 1                     LCe,Avg         LMe,Avg
+                                                                                                                  2     e=1,e̸=n          b       +        b
+17   patterns during early exploration. To address these challenges,
+
+18   we propose a heuristic-guided learning algorithm that inte-                             where    LCe,Avg            LMe,Avg
+                                                                                                           b        and       b        are the augmented average CPU          71
+19   grates data augmentation to enhance experience coverage and                             and memory loads inDCe, respectively, as derived from ¯on′b .          72
+
+20   incorporates heuristic functions as structured priors, improving                        This score models the intuitive principle that the feasibility          73
+
+21   training efﬁciency and stabilizing policy convergence.                                  of creating new instances decreases when other data centers          74
+
+22      1) Data  Augmentation:  We  introduce  random  amplitude                             operateathighresourceutilization.Byaggregatingtheaverage          75
+
+23   scaling  to  increase  the  diversity  of  sampled  experiences,                        CPU and memory loads of all other data centers in an equal          76
+
+24   enabling  agents  to  learn  more  robust  representations  from                        manner,δnb  provides a one-step approximation of the global          77
+
+25   limited  data  [51],  [52].  For  each  agent    n,  a  mini-batch  of                  resource  availability  from  the  perspective  of  agentn.  By          78
+
+26   sizeB  is  randomly  sampled  from  its  replay  buffer Bn.                             combining the local and cross-agent success scores, the overall          79
+
+27   Let (onb,anb,rnb,on′b )(b = 1,2,...,B) be theb-th transition                            success score of agentn is evaluated as:                                                                       80
+
+28   tuple in the mini-batch. The random scaling transformation
+29   is applied to the current and next observations, yielding the                                               HnSR(¯on′b ) =λl×k
+                                                                                                                                          V  +λc×δnb,                 (21)
+30   modiﬁed representations:                                                                whereλl andλc are the weighting coefﬁcients of the local        81
+                          ¯onb =onb ×z,    ¯on′b  =on′b ×z,                  (19)            and cross-agent success scores, respectively. This formulation          82
+                                                                                             reﬂects  the  prior  knowledge  that  instance  creation  in  dis-           83
+31   wherez  ∼ U(x,y)  is  a  random  scaling  factor  sampled
+                                                                                             tributed data centers is inﬂuenced  by the feasibility of the           84
+32   from a uniform distribution within the range [x,y]. Notably,
+                                                                                             local data center and the global resource availability across          85
+33   the  personalized  reward  function  of  agentn  is  invariant
+                                                                                             other data centers [54]. The weighted sum provides a linear                   86
+34   to  observation  scaling,  i.e.,rnb(onb,anb)  =rnb(¯onb,anb).  This
+                                                                                             approximation of this multi-factor dependency, allowing the          87
+35   transformation modiﬁes the intensity of observations without
+                                                                                             heuristic  to  balance  local  resource  sufﬁciency  and  global        88
+36   altering their temporal structure or the relative relationships
+                                                                                             resource availability during the scheduling process. We treat          89
+37   among different resource dimensions, since the same scaling
+                                                                                             (λl,λc) as a convex-combination trade-off withλl +λc = 1          90
+38   factorz is uniformly applied to all features. As a result, work-
+                                                                                             and setλl>λc, reﬂecting the typically stronger impact of local           91
+39   load semantics such as burst patterns, CPU-memory coupling,
+                                                                                             feasibility while using the cross-agent term as a regularizer          92
+40   and peak locations are largely preserved. To avoid generating
+                                                                                             to maintain global coordination. To reﬂect the load balancing           93
+41   infeasible states, the scaled features are clipped to valid ranges
+                                                                                             condition  of  ¯on′b ,  we  substitute  the  augmented  CPU  and          94
+42   after augmentation. Conceptually, amplitude scaling increases
+                                                                                             memory loads of all virtual machines into (3) and (5), then                      95
+43   the  variability  of  observations  within  a  local  neighborhood
+                                                                                             obtain the augmented CPU load balancing degree                          LBnCpu,b          96
+44   around training samples, which is consistent with the intuition
+                                                                                             and augmented memory load balancing degree                         LBnMem,b of          97
+45   of vicinal risk minimization [53] and helps agents learn scale-
+                                                                                             DCn. The load balancing score of agentn is deﬁned as:                    98
+46   invariant representations. From a regularization perspective,
+47   the transformation can also be regarded as injecting structured                                                                LBnCpu,b+       LBnMem,b
+                                                                                                           HnLB(¯on′b ) = 1−
+48   multiplicative noise to smooth the learned value function and                                                                                2      ,          (22)
+
+49   improve generalization without introducing semantic noise.                              whereHnLB  averages the CPU and memory load balancing          99
+
+50      2) Heuristic Function:  Based on the multi-objective opti-                           degrees and subtracts the result from 1, yielding a normalized        100
+
+51   mization formulation in SectionIII-C, we construct a domain                             score  in  [0,1].  This  score  increases  with  more  balanced        101
+
+52   heuristicfunctionHn foreachagentn.Thisfunctionevaluates                                 resource utilization and reﬂects the domain knowledge that         102
+
+53   the  augmented  next  observation  ¯on′b    and  outputs  a  scalar                     balanced loads help prevent resource overloading.                                          103
+
+54   guidance  value  i.e.,Hn  :  ¯on′b  → R.  Each  component  of                              The  energy  consumption  score  is  used  to  evaluate  the        104
+
+55   the  heuristic  is  systematically  derived  by  decomposing  the                       energy efﬁciency of data centers. As deﬁned in (8), energy           105
+
+
+             Authorized licensed use limited to: Inner Mongolia University. Downloaded on March 04,2026 at 10:41:44 UTC from IEEE Xplore.  Restrictions apply.
+                           © 2026 IEEE. All rights reserved, including rights for text and data mining and training of artificial intelligence and similar technologies. Personal use is permitted,
+                                            but republication/redistribution requires IEEE permission. See https://www.ieee.org/publications/rights/index.html for more information.
+
+===== PDF PAGE 8 =====
+                            This article has been accepted for publication in IEEE Transactions on Services Computing. This is the author's version which has not been fully edited and
+                                                     content may change prior to final publication. Citation information: DOI 10.1109/TSC.2026.3656552
+
+                                                                                                                                                                                       8
+
+
+                                                                                                 n that controls the trade-off between the entropy term and          36
+                                                                                                 the modiﬁed reward, andH(µn(·| ¯ont)) = −logµn(·| ¯ont)          37
+                                                                                                 is the entropy ofµn at ¯ont. The architecture of the MADSAC          38
+                                                                                                 algorithm is shown in Fig.3. Each agent   n is equipped with an          39
+                                                                                                 actor network parameterized byθn, two critic networks with          40
+                                                                                                 parametersφn1  andφn2, and two target critic networks with          41
+                                                                                                 parameters ¯φn1 and ¯φn2.Duringtraining,allnetworkparameters          42
+                                                                                                 of each agent are randomly initialized. Agents then iteratively          43
+                                                                                                 updatetheirparametersusingaugmentedobservations,actions,          44
+                                                                                                 and the modiﬁed rewards.                                                                                                                 45
+                                                                                                    1) Actor Network Update:  The loss function for updating          46
+     Fig. 3.  The architecture of the MADSAC algorithm.                                          the temperature parameterγn is deﬁned as:                                                             47
+
+
+1    consumption  is  primarily  inﬂuenced  by  the  CPU  load  of                                                               B∑
+
+2    virtual machines. The energy consumption score of agentn                                                 L(γn) = 1               γn(−logµθn(¯onb)−             H),        (27)
+                                                                                                                            B   b=1
+3    is calculated as:
+                             HnEC(¯on′b ) = 1−        LCn,Avgb  .                     (23)       whereµθn(¯onb) is the categorical policy distribution over all          48
+
+
+4       Thisformulationprovidesanormalizedenergyconsumption                                      discrete actions given ¯onb  and outputs the action probability,          49
+
+5    score in [0,1], reﬂecting the domain knowledge that lower                                   and    H  is  a  predeﬁned  target  entropy.  Subsequently, ¯onb  is          50
+
+6    averageCPUutilizationcorrespondstolowerenergyconsump-                                       fed into two critic networks, which output the corresponding          51
+
+7    tion. The heuristic function of agentn is deﬁned as:                                        soft-Q functionsQφn1(¯onb) andQφn2(¯onb), respectively. The loss          52
+     Hn(¯on′b ) =wn1×HnSR(¯on′b )+wn2×HnLB(¯on′b )+wn3×HnEC(¯on′b ),                             function for the actor network of agentn is deﬁned as:                          53
+                                                                                       (24)                          B∑   [                                                  ]
+
+
+8    which  is  a  weighted  combination  of  three  scheduling  ob-                               L(θn) = 1                γnlogµθn(¯onb)−  minx∈{1,2}Qφnx (¯onb)              .  (28)
+                                                                                                                B   b=1
+9    jectives. Inspired by the principle of potential-based reward
+
+10   shaping [55], which is commonly used to provide additional
+                                                                                                    Then, the actor network parameterθn is updated as:                             54
+11   structured guidance, we reformulate the personalized reward
+
+12   of agentn as:                                                                                                        θn←θn−ηa∇θnL(θn),                      (29)
+             ¯rnb(¯onb,anb) =rn(¯onb,anb)+α(1−β)Hn(¯on′b ),        (25)                          whereηc is the learning rate of the actor network.                                          55
+
+
+13   whereβ ∈  [0,1]  is  a  mixing  coefﬁcient  that  controls  the                                2) Critic Network Update:  Two critic networks take the          56
+
+14   contribution of heuristic information to the modiﬁed reward.                                tuple (¯onb,anb) as inputs and output the corresponding soft-Q          57
+
+15   H-MAR reformulates the original Dec-POMDP into a mod-                                       functionsQφn1(¯onb,anb) andQφn2(¯onb,anb), respectively. Next,          58
+
+16   iﬁed  decision  process           M  =  (O,A,R,P,¯α),  where                    O  is       ¯on′b   is input into the actor network to obtainµθn(¯on′b ), from          59
+
+17   the augmented observation space,                 R is the heuristic-modiﬁed                 which the next actionan′b   is sampled, i.e.,an′b  ∼µθn(¯on′b ).          60
+
+18   reward function, and ¯α =αβ is the modiﬁed discount factor.                                 Subsequently, the tuple (¯on′b,an′b ) is input into the two target          61
+
+19   Through  this  reformulation,  H-MAR  reshapes  the  learning                               critic networks, yielding the corresponding soft-Q functions          62
+
+20   problem, enabling agents to learn more efﬁciently and adapt                                 Q¯φn1(¯on′b,an′b ) andQ¯φn2(¯on′b,an′b ). The target value  ˆQ(¯onb,anb)          63
+
+21   to dynamic environments, progressively reﬁning their policies                               is calculated as:                                                                                                                                                64
+22   and improving overall system performance.                                                                               [                                                          ]
+                                                                                                 ˆQ(¯onb,anb) = ¯rnb+¯α          minx∈{1,2}Q¯φnx (¯on′b,an′b )−γnlogµθn(¯on′b )            .
+
+23   C. Multi-Agent Discrete Soft Actor-Critic Algorithm
+                                                                                                                                                                                  (30)
+24      The DSAC algorithm is designed for discrete action spaces
+                                                                                                    The loss function for each critic network is deﬁned as:                    65
+25   and  maximizes  the  expected  policy  entropy  to  encourage
+                                                                                                                       B∑[                                        ]2,x∈{1,2}.
+26   exploration, thereby promoting more diverse action selection
+                                                                                                 L(φnx) =  1                 Qφnx (¯onb,anb)− ˆQ(¯onb,anb)
+27   [56],[57].Thispropertyenhancespolicyrobustnessandadapt-                                                    2B
+                                                                                                                      b=1
+28   ability in dynamic and uncertain environments. To facilitate                                                                                                                 (31)
+
+29   decentralized  collaboration  in  distributed  data  centers,  we                              The critic network parameters are then updated as:                                 66
+
+30   extend the DSAC algorithm to a multi-agent setting, forming
+31   the MADSAC algorithm [58]. Within the MADRL framework,                                                       φnx ←φnx−ηc∇φnxL(φnx),x∈{1,2},            (32)
+
+
+32   MADSAC enables each agent to learn a policy by optimizing
+                                                                                                 whereηc is the learning rate of the critic networks.                                       67
+33   the maximum entropy objective:
+                                       T−1∑                                                         3) Target  Critic  Network  Update:   To  enhance  training          68
+                 µn∗ = argmax                Eτ(µn)[(¯α)t(¯rn(¯ont,ant)                          stability, the parameters of two target critic networks ¯φn1  and          69¯φn2 are updated using the soft update rule:                                                                  70
+                               µn      t=0                                             (26)
+                                 +γnH(µn(·| ¯ont)))],                                                              ¯φnx ←τφnx +(1−τ)¯φnx,x∈{1,2},              (33)
+
+
+
+34   whereτ(µn)  is the trajectory distribution of agentn when                                   whereτ  ≪  1  is  the  soft  update  coefﬁcient.  The  overall        71
+
+35   executing policyµn,γn is the temperature parameter of agent                                 pseudocode of H-MAR is shown in Algorithm1.                                                                               72
+
+
+              Authorized licensed use limited to: Inner Mongolia University. Downloaded on March 04,2026 at 10:41:44 UTC from IEEE Xplore.  Restrictions apply.
+                            © 2026 IEEE. All rights reserved, including rights for text and data mining and training of artificial intelligence and similar technologies. Personal use is permitted,
+                                              but republication/redistribution requires IEEE permission. See https://www.ieee.org/publications/rights/index.html for more information.
+
+===== PDF PAGE 9 =====
+                            This article has been accepted for publication in IEEE Transactions on Services Computing. This is the author's version which has not been fully edited and
+                                                    content may change prior to final publication. Citation information: DOI 10.1109/TSC.2026.3656552
+
+                                                                                                                                                                                     9
+
+
+     Algorithm 1 The Proposed H-MAR Approach.
+     Input: Set of jobs Jn(t) = {Jobn1,Jobn2,...,JobnJ} to be
+           scheduled in each data centerDCn.
+      Output: Optimizedµn∗ for each agent.
+       1: for episode= 1,2,...,E do
+       2:     Initialize all network parameters, each agentn obtains
+              initial observationont  from the environment.
+       3:     for time slott = 1,2,...,T do
+       4:         Each agent n executes:
+       5:         Select and execute actionant ∼µn(·|ont)ant.                                   Fig. 4.  An intuitive overview of the theoretical analysis.
+       6:         Receive  the  personalized  rewardrnt   and  the  next
+                  observationont+1.                      )into replay bufferBn.                 initial joint observation  distribution,Jµ  is the  joint policy          27
+       7:         Store tuple(ont,ant,rnt,ont+1                                                 value function induced byµ, Gap term quantiﬁes the learning          28
+       8:         if|Bn|>B then                                                                 gap becauseµ is suboptimal in                   M, and Offset term is the          29
+       9:             Randomly sample a mini-batch ofB tuples from                              inherent offset between the solution in              M andM. Speciﬁcally,          30
+                     replay bufferBn;                                                           we deﬁne:                                                                                                                                                                 31
+     10:             Obtain augmented observations using (19);                                        Gap(H,β,µ) =β(¯J∗(x0)− ¯Jµ(x0))
+     11:             Modify the personalized reward using (20)-(25);                                                                       (¯J∗(xµ)− ¯Jµ(xµ)),       (35)
+     12:             Update the temperature parameterγn using (27);                                                           + 1−β1−α
+     13:             Update the actor network parameterθn using (28)                                                                                                                        32
+                     and (29);                                                                      Offset(H,β,µ) =(J∗(x0)− ¯J∗(x0))+α(1−β)1−α                                   (36)
+     14:             Update two critic network parametersφn1  andφn2                                                         ExµE¯o′|¯o,a[H(¯o′)− ¯J∗(¯o′)],
+                     using (31) and (32);
+     15:             Update  two  target  critic  network  parameters  ¯φn1                     where  ¯J∗  is the modiﬁed optimal value function,  ¯Jµ  is the          33
+                     and ¯φn2 using (33).                                                       modiﬁed joint policy value function induced byµ, andxµ is          34
+     16:         end if                                                                         the joint observation distribution induced byµ. Moreover, for          35
+     17:     end for                                                                            any constantc ∈ R, Gap(H,β,µ) = Gap(H +c,β,µ) and          36
+     18: end for                                                                                Offset(H,β,µ) = Offset(H +c,β,µ).                                                                               37
+                                                                                                Proposition 1. For any joint heuristic functionH, the mixing          38
+                                                                                                coefﬁcientβ,  and  joint  policyµ,  we  deﬁne  the  modiﬁed          39
+1    D. Theoretical Analysis of the Proposed Approach
+                                                                                                average reward function as:                                                                                                            40
+2       Fig.4provides  an  intuitive  overview  of  the  theoretical
+3    analysis  underlying  the  proposed  H-MAR  approach.  Start-                                          ¯r(¯o,a) =r(¯o,a)+α(1−β)E¯o′|¯o,a[H(¯o′)].      (37)
+
+
+4    ing  from  the  original  Dec-POMDP M,  we  establish  the                                    Then the Gap term can be expressed as Gap(H,β,µ) =          41
+                                                                                                              [∑∞                          ]
+5    modiﬁed Dec-POMDP                 M using the joint heuristic function
+                                                                                                −Eτµ(x0)           t=0αtF∗(¯ot,at)          , where     F∗(¯o,a) = ¯r(¯o,a)+          42
+6    H ={H1,H2,...,HN}, the data augmentation factorz, and
+7    mixing coefﬁcientβ. Theorem 1 shows that the performance                                   ¯αE¯o′|¯o,a[¯J∗(¯o′)]− ¯J∗(¯o) ≤ 0 is the action gap in                    M, and          43
+
+8    loss of the learned joint policyµ ={µ1,µ2,...,µN} in M                                     ¯α =αβ is the modiﬁed discount factor.                                                                          44
+
+
+9    can be decomposed into two components: a Gap term and an                                   Proposition  2.  1) If the personalized rewardrn(on,an) ∈          45
+
+10   Offset term. The Gap term measures how suboptimal policy                                   [−1,1]  for  each  agentn  in M,  then  the  average  reward          46
+
+11   µ  is  when  solving         M,  while  the  Offset  term  captures  the                   satisﬁesr(¯o,a) ∈ [−1,1], and the joint heuristic function is          47
+                                                                                                                                [          ]
+12   inherent difference betweenM and                   M. Proposition 1 further
+                                                                                                bounded asH(¯o) ∈                0,   11−α  . Consequently, for any joint          48
+13   explains the Gap term at the trajectory level, showing that
+                                                                                                policyµ, the modiﬁed value function is bounded as  ¯Jµ(¯o)∈          49
+14   it corresponds to the accumulated action-level suboptimality                               [                   ]
+
+15   along trajectories induced byµ in                   M. Proposition 3 char-                  −    11−αβ,   11−α  . 2) If M is linear, where the average reward          50
+
+16   acterizes a theoretical guarantee for an improvable heuristic                              functionr(o,a) and the expected transitions Eo′|o,a[G(o′)]          51
+
+17   H, stating that it serves as a lower bound on the modiﬁed                                  are linear with respect to a feature vectorϕ(o,a) for any          52
+
+18   optimal value function, which is the key to controlling the                                functionG(o), then            M also remains linear with respect to          53
+
+19   Offset term. Finally, Proposition 2 guarantees that                    M remains           the same feature vectorϕ(o,a).                                                                                                 54
+
+20   feasible, with bounded value functions and preserved linear
+                                                                                                Proposition 3. If the joint heuristic functionH is improvable          55
+21   structure, so that standard MADRL algorithms can be applied
+                                                                                                for the original M, for allβ ∈ [0,1],  ¯J∗(¯o) ≥H(¯o). In          56
+22   stably. The detailed proofs are provided in Appendix A.
+                                                                                                particular, ifH is deﬁned asH(¯o) =Q(¯o,µ′) for some joint          57
+23   Theorem 1. For any joint policyµ, joint heuristic functionH,                               policyµ′, andQ(¯o,a) ≤ (TH)(¯o,a), thenH  satisﬁes the          58
+
+24   data augmentation factorz, and mixing coefﬁcientβ∈ [0,1],                                  improvability condition and underestimates the value function          59
+
+25   we have:                                                                                   Jµ′(¯o), ensuring thatH(¯o)≤Jµ′(¯o).                                                                               60
+       J∗(x0)−Jµ(x0) = Gap(H,β,µ)+Offset(H,β,µ),  (34)                                             Beyond  the  Gap-Offset  performance  decomposition,  we          61
+                                                                                                investigate the computational complexity and scalability of H-          62
+26   whereJ∗  is the optimal value function,x0 ∈ ∆(O) is the
+                                                                                                MAR in Appendix B.                                                                                                                               63
+
+              Authorized licensed use limited to: Inner Mongolia University. Downloaded on March 04,2026 at 10:41:44 UTC from IEEE Xplore.  Restrictions apply.
+                            © 2026 IEEE. All rights reserved, including rights for text and data mining and training of artificial intelligence and similar technologies. Personal use is permitted,
+                                             but republication/redistribution requires IEEE permission. See https://www.ieee.org/publications/rights/index.html for more information.
+
+===== PDF PAGE 10 =====
+                            This article has been accepted for publication in IEEE Transactions on Services Computing. This is the author's version which has not been fully edited and
+                                                     content may change prior to final publication. Citation information: DOI 10.1109/TSC.2026.3656552
+
+                                                                                                                                                                                      10
+
+
+
+                                           TABLE III
+                             HYPERPARAMETERS OF H-MAR
+               Parameter                     Value                 Parameter               Value
+          Number of episodes              1000         Number of time slots        200Discount factor                   0.99               Mini-batch size             256
+     Cross-agent success weight          0.4             Mixing coefﬁcient          0.98Uniform distribution range      [0.8,1.2]       Local success weight         0.6
+             Learning rate                  0.0005       Soft update coefﬁcient       0.01
+              Nonlinearity                    ReLU                  Optimizer                Adam
+                                                                                                             (a) Trace v2018                             (b) Trace v2020
+
+1                             V.  SIMULATION RESULTS                                             Fig. 5.  Convergence of learning-based approaches on trace v2018 and v2020.
+
+
+2       In  this  section,  we  conduct  experiments  to  evaluate  the                             In the proposed H-MAR approach, the actor and critic net-          48
+
+3    performance of our proposed H-MAR approach.                                                 works are implemented as three-layer fully connected neural          49
+
+
+4    A. Experiment Setup                                                                         networks, with two hidden layers containing 64 neurons each.          50
+                                                                                                 The detailed hyperparameter settings are summarized in Table          51
+5       Simulations  are  executed  on  a  server  equipped  with  an
+                                                                                                 III. Moreover, we compare the proposed H-MAR approach                 52
+6    Intel(R) Xeon(R) Gold 5220 CPU @ 2.20 GHz, 120GB RAM,
+                                                                                                 with six baselines to evaluate its performance.                                                      53
+7    and two Tesla V100-SXM2-32GB GPUs. All experiments are
+8    implemented in Python 3.10 with PyTorch 2.3.1. Referring                                       •  Random: Each agent allocates instances randomly to any          54
+
+9    to [8], [37], the simulated system comprises three types of                                        virtual machine within its local or other data centers. This          55
+
+10   data centers, with a total of 18–72 virtual machines. Type-                                        serves as a baseline for non-intelligent scheduling, with          56
+
+11   1, Type-2, and Type-3 data centers provide virtual machine                                         no predeﬁned policy or optimization objective.                                     57
+
+12   conﬁgurations of (8 cores, 16GB) and (16 cores, 32GB); (8                                      •  Round Robin: Each agent sequentially allocates instances          58
+
+13   cores, 16GB), (16 cores, 32GB), and (32 cores, 64GB); and                                          across all virtual machines within its local and other data          59
+
+14   (16 cores, 32GB) and (32 cores, 64GB). They are assigned                                           centers, aiming to balance the workload distribution.                     60
+
+15   optimization weights (wn1,wn2,wn3) for SRIC, load balancing,                                   •  Greedy: Each agent estimates the expected score of all          61
+
+16   and energy consumption: (0.5, 0.3, 0.2), (0.2, 0.3, 0.5), and                                      candidate  actions  from  the  observed  state  and  selects          62
+
+17   (0.2, 0.5, 0.3), which are chosen to simulate diverse oper-                                        the one with the highest score that satisﬁes SLA con-        63
+
+18   ational preferences and capture the impact of heterogeneity                                        straints [30]. This approach optimizes per-slot decisions,                   64
+
+19   on collaborative scheduling. The power consumption of each                                         but may overlook long-term global objectives.                                        65
+
+20   virtual machine is set toPidle = 100W,Pfull = 300W [49].                                       •  MAPPO:  MAPPO  is  implemented  under  the  MAAC          66
+
+21      Workload  characteristics  are  derived  from  the  Alibaba                                     framework,  integrating  value-based  and  policy-based          67
+
+22   Cluster  trace  v2018  and  v2020  datasets1,  which  contain                                      learning [41]. Agents collaboratively learn adaptive poli-                   68
+
+23   real-world production workload logs. In our system model,                                          cies in distributed data centers.                                                                                     69
+
+24   computing  services  are  represented  as  structured  jobs  with                              •  MAQMIX:  MAQMIX  is  a  value-based  MADRL  algo-          70
+
+25   multiple  tasks  and  instances,  which  are  directly  mapped                                     rithm that combines agent utilities through a monotonic          71
+
+26   from trace-level jobs to ensure consistency with real-world                                        mixing network and updates the centralized critic using          72
+
+27   traces.  From  the  batch_task.csv  (trace  v2018)  and                                            DQN-style  temporal-difference  learning  with  evaluate          73
+
+28   pai_task_table.csv   (trace   v2020)   ﬁles,   CPU   and                                           and target networks [59].                                                                                                                74
+
+29   memory  demands  are  obtained  from  the  plan_cpu  and                                       •  NichGPDRL: Niching genetic programming (NichGP)-          75
+
+30   plan_mem  ﬁelds,  and  instance  durations  are  computed  as                                      assisted DRL constructs the DRL action space using a          76
+
+31   end_time minusstart_time. Notably, the task-level ﬁles                                             diverse set of scheduling heuristics evolved by NichGP.          77
+
+32   primarily  record  the  speciﬁcations  of  computing  resources,                                   Agentsselectoneheuristictodispatchinstances,reducing          78
+
+33   whereas network bandwidth and storage I/O information are                                          reliance on manually designed heuristic rules [60].                                    79
+
+34   not deﬁned as resource demand ﬁelds in the logs.                                               In the following evaluation, each result represents the av-          80
+
+35      We perform standard preprocessing that removes records                                   erage  of  ﬁve  independent  experiment  runs  and  reﬂects  the          81
+
+36   withmissingorcorruptedtimestampsandﬁltersinstanceswith                                      average performance per episode of all time slots throughout          82
+
+37   non-positive  durations  or  abnormal  resource  speciﬁcations.                             the training process.                                                                                                                                    83
+
+38   These operations preserve the essential workload distribution
+                                                                                                 B. Comparison of Convergence and Time Efﬁciency                                     84
+39   while eliminating malformed entries. Computing service ar-
+40   rivals at each data center are modeled as a Poisson process                                    Figs.5and(b)show  the  convergence  performance  of                                              85
+
+41   with average rates of 1.4, 1.7, and 2 for Type-1, Type-2, and                               learning-based approaches on trace v2018 and v2020 datasets,          86
+
+42   Type-3  [40],  allowing  controlled  scenario  variation  in  load                          where  the  shaded  regions  indicate  the  standard  deviation          87
+
+43   intensity. To further improve simulation stability, we cap task                             across multiple runs. H-MAR achieves better convergence and          88
+
+44   instances per job (ﬁve for v2018, two for v2020) and limit                                  stabilizes at a higher average reward than MAPPO, MAQMIX,          89
+
+45   maximum durations (200s and 100s, respectively), preventing                                 and  NichGPDRL  on  both  datasets.  Although  the  variance          90
+
+46   extreme jobs from dominating resource usage without altering                                of H-MAR during early training stages is comparable to or          91
+
+47   the workload distribution.                                                                  slightly larger than that of other approaches due to stronger          92
+                                                                                                 exploration, its ﬂuctuations gradually decrease as training pro-           93
+        1https://github.com/alibaba/clusterdata                                                  gresses. After stabilization, H-MAR achieves 14.33-87.45%          94
+
+
+              Authorized licensed use limited to: Inner Mongolia University. Downloaded on March 04,2026 at 10:41:44 UTC from IEEE Xplore.  Restrictions apply.
+                            © 2026 IEEE. All rights reserved, including rights for text and data mining and training of artificial intelligence and similar technologies. Personal use is permitted,
+                                              but republication/redistribution requires IEEE permission. See https://www.ieee.org/publications/rights/index.html for more information.
+
+===== PDF PAGE 11 =====
+                            This article has been accepted for publication in IEEE Transactions on Services Computing. This is the author's version which has not been fully edited and
+                                                    content may change prior to final publication. Citation information: DOI 10.1109/TSC.2026.3656552
+
+                                                                                                                                                                                  11
+
+
+
+                                          TABLE IV                                             C. Performance of Different Approaches                                                                       46
+                            EVALUATION OF TIME EFFICIENCY
+              Datasets         Approaches      Training Time      Decision Time                   Fig.6shows  the  performance  comparison  of  different                         47
+                                H-MAR            10340.575 s             1.328 ms              scheduling  approaches  on  trace  v2018  dataset  in  terms  of          48
+                                MAPPO            11946.170 s             2.234 ms
+            Trace v2018       NichGPDRL          5086.772 s              0.717 msMAQMIX           10828.045 s             0.339 msthree  metrics:  average  SRIC,  load  balancing  degree,  and          49
+                                 Greedy                      -                      5.736 ms   energy  consumption.  A  higher  SRIC  value  (closer  to  1)          50
+                             Round Robin                 -                      0.014 ms       indicates  a  better  success  rate  of  instance  creation,  while          51
+                                Random                     -                      0.008 ms     lower values of load balancing degree and energy consumption          52
+                                MAPPO             6428.771 s              1.153 msH-MAR             5220.552 s              0.966 ms
+            Trace v2020        MAQMIX            4217.523 s              0.278 ms              denote more balanced resource utilization and higher energy          53
+                              NichGPDRL          5671.857 s              0.737 msGreedy                      -                      5.457 msefﬁciency, respectively. We conduct paired two-sided t-tests        54
+                             Round Robin                 -                      0.009 ms       on the per-run metric averages over ﬁve independent runs.        55
+                                Random                     -                      0.013 ms     As shown in Fig.6(a), H-MAR achieves the highest SRIC                                 56
+                                                                                               among  all  approaches,  outperforming  MAPPO  by  2.15%,          57
+                                                                                               MAQMIX  by  9.20%,  NichGPDRL  by  17.28%,  Greedy  by          58
+1    higher  average  reward  on  trace  v2018  and  20.65-65.65%
+                                                                                               9.20%, Round Robin by 15.85%, and Random by 18.75%.          59
+2    higher reward on trace v2020, demonstrating its superiority
+                                                                                               Statistical tests further validate these improvements: H-MAR          60
+3    in  learning  efﬁciency  and  steady-state  performance.  These
+                                                                                               achieves a higher SRIC than MAPPO, MAQMIX, and NichG-          61
+4    advantages arise from personalized multi-objective optimiza-
+                                                                                               PDRL  (p<  0.05),  and  shows  gains  over  Greedy,  Round          62
+5    tion, which aligns each agent’s policy with individual data
+                                                                                               Robin, and Random (p< 0.001). Both H-MAR and MAPPO          63
+6    center goals, and from heuristic functions that guide policy
+                                                                                               achieve  higher  SRIC  values  than  MAQMIX,  NichGPDRL,          64
+7    learning and accelerate convergence. It is worth noting that
+                                                                                               Greedy, Round Robin, and Random, demonstrating their supe-          65
+8    tracev2020ischaracterizedbyhighercomputationaldemands,
+                                                                                               rior ability to satisfy SLA constraints and maintain higher QoS          66
+9    which prolongs convergence for all approaches. Nevertheless,
+                                                                                               levels. The lower SRIC values of these approaches indicate          67
+10   H-MAR maintains its advantage through data augmentation,
+                                                                                               that  they  are  less  effective  at  matching  the  characteristics          68
+11   which  enhances  the  ability  of  agents  to  generalize  across
+                                                                                               of computing service with resource allocation. In particular,          69
+12   diverse workload patterns. In contrast, MAPPO, MAQMIX,
+                                                                                               NichGPDRL performs even worse than Round Robin, indi-          70
+13   and  NichGPDRL  exhibit  reduced  stability  and  struggle  to
+                                                                                               cating that heuristic-based action abstractions may be suitable          71
+14   generalize under such conditions.
+                                                                                               for distributed data center scheduling, where decisions need to          72
+
+15      TableIVshows the training and decision times of all ap-                                handle high-dimensional system states and complex trade-offs          73
+
+16   proaches on trace v2018 and v2020 datasets. Among learning-                               among multiple objectives.                                                                                                                74
+
+17   based approaches, H-MAR requires shorter training time than                                  Fig.6(b)shows  that  H-MAR  achieves  the  lowest  load                                 75
+
+18   MAPPO,  with  reductions  of  13.44%  on  trace  v2018  and                               balancing  degree,  reducing  it  by  10.71%  compared  with          76
+
+19   18.79% on trace v2020, suggesting that the data augmentation                              MAPPO, 0.40% compared with MAQMIX, 27.22% compared          77
+
+20   in H-MAR improves sample efﬁciency during policy learning.                                with NichGPDRL, 17.00% compared with Greedy, 34.86%          78
+
+21   In the decision-making process, H-MAR also achieves shorter                               compared  with  Round  Robin,  and  39.71%  compared  with          79
+
+22   inference time, reducing the decision time by 40.56% on trace                             Random. Statistical tests conﬁrm these observations: H-MAR        80
+
+23   v2018 and 16.22% on trace v2020 compared with MAPPO.                                      outperformsMAPPO(p< 0.05)andshowsgainsoverGreedy,          81
+
+24   MAQMIX  exhibits  competitive  time  efﬁciency,  achieving                                Round Robin, and Random (p< 0.001). Its difference from          82
+
+25   23.14% shorter training time than H-MAR on trace v2020 and                                NichGPDRL is marginal (p> 0.05), while the difference from          83
+
+26   the fastest decision time among all learning-based approaches,                            MAQMIX is not signiﬁcant due to the close means and the        84
+
+27   due to its lightweight value-based mixing architecture. NichG-                            high variance of MAQMIX across runs. H-MAR, MAPPO,          85
+
+28   PDRL, which evolves scheduling heuristics through genetic                                 and MAQMIX adopt adaptive resource allocation policies that          86
+
+29   programming rather than optimizing neural networks, yields                                respond to workload and resource variations, whereas NichG-          87
+
+30   the  shortest  training  time  on  v2018.  Its  training  time  on                        PDRL  suffers  from  unstable  heuristic  evolution.  Moreover,          88
+
+31   v2020 becomes longer because of the higher workload vari-                                 non-learning-based  approaches  (Greedy,  Round  Robin,  and          89
+
+32   ability, which likely increases the heuristic search space and                            Random) exhibit limited adaptivity, resulting in weaker load          90
+
+33   requires more evolutionary generations for convergence. Com-                              balancing performance.                                                                                                                           91
+
+34   pared  with  non-learning-based  baselines,  all  learning-based
+                                                                                                  Fig.6(c)shows the average energy consumption of differ-                                 92
+35   approaches  incur  higher  decision  times  than  Random  and
+                                                                                               ent approaches. H-MAR consumes 0.10% less energy than          93
+36   Round  Robin  due  to  the  forward  propagation  required  for
+                                                                                               MAPPO,  1.57%  less  than  Round  Robin,  and  0.51%  less          94
+37   neural network inference, but they achieve shorter decision
+                                                                                               energy  than  Random,  while  consuming  55.66%  more  than          95
+38   times than the Greedy approach. For most approaches, the
+                                                                                               MAQMIX, 4.84% more than NichGPDRL, and 0.50% more          96
+39   overall training and decision times on trace v2020 are shorter
+                                                                                               than Greedy. Statistical tests show that the difference between          97
+40   than those on trace v2018, which can be attributed to its job
+                                                                                               H-MAR and MAQMIX is signiﬁcant (p< 0.001). In contrast,          98
+41   instance scale and execution duration characteristics, leading
+                                                                                               its differences from MAPPO, NichGPDRL, Greedy, Round          99
+42   to more efﬁcient processing within each scheduling time slot.
+                                                                                               Robin, and Random are not statistically signiﬁcant (p> 0.05),        100
+43   The results show that the heuristic-guided design improves
+                                                                                               as  these  approaches  have  similar  energy  consumption.  The        101
+44   time efﬁciency for both training and decision-making, making
+                                                                                               lower energy consumption of MAQMIX, NichGPDRL, and        102
+45   H-MAR suitable for deployment in distributed data centers.
+
+              Authorized licensed use limited to: Inner Mongolia University. Downloaded on March 04,2026 at 10:41:44 UTC from IEEE Xplore.  Restrictions apply.
+                            © 2026 IEEE. All rights reserved, including rights for text and data mining and training of artificial intelligence and similar technologies. Personal use is permitted,
+                                             but republication/redistribution requires IEEE permission. See https://www.ieee.org/publications/rights/index.html for more information.
+
+===== PDF PAGE 12 =====
+                           This article has been accepted for publication in IEEE Transactions on Services Computing. This is the author's version which has not been fully edited and
+                                                  content may change prior to final publication. Citation information: DOI 10.1109/TSC.2026.3656552
+
+                                                                                                                                                                           12
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                (a)                                                   (b)                                                    (c)
+     Fig. 6.  Performance comparison of different scheduling approaches on trace v2018.
+
+
+
+
+
+
+
+
+
+
+
+                               (a)                                                    (b)                                                     (c)
+     Fig. 7.  Performance comparison of different scheduling approaches on trace v2020.
+
+
+1    Greedy is largely attributed to their lower SRIC values, which
+
+2    reﬂect reduced resource utilization. Conversely, H-MAR and
+
+3    MAPPO create more instances to satisfy SLA constraints and
+
+4    improveresourceutilization,whichincreasesenergyconsump-
+
+5    tion.  Random  and  Round  Robin  incur  the  highest  energy
+
+6    consumption due to inefﬁcient resource allocation. Overall,
+
+7    Figs.6(a),(b),and(c)revealthatH-MARachievesaneffective
+
+8    multi-objective trade-off in distributed data centers. It delivers
+9    the highest SRIC, maintains a relatively low load balancing                           Fig. 8.  Evolution of local and cross-agent SRIC on trace v2018 and 2020.
+
+
+10   degree, and keeps energy consumption at a competitive level.                          (52.92%), while remaining considerably lower than NichG-          40
+
+
+11      Fig.7shows  the  performance  comparison  of  different                            PDRL. Statistical tests show that the energy differences be-          41
+
+12   scheduling approaches on the trace v2020 dataset. Compared                            tween H-MAR and MAQMIX or NichGPDRL are signiﬁcant        42
+
+13   with trace v2018, the overall results for average SRIC, load                          (p< 0.001), while the differences from MAPPO, Greedy,          43
+
+14   balancing degree, and energy consumption decrease due to the                          and Round Robin are not statistically signiﬁcant (p> 0.05).          44
+
+15   increased computational demands of jobs on trace v2020. As                            The difference from Random is marginally signiﬁcant (p<          45
+
+16   shown in Figs.7(a)and(b), H-MAR continues to achieve the                              0.05). Interestingly, MAQMIX achieves much lower energy          46
+
+17   highest SRIC and the lowest load balancing degree among                               consumption than H-MAR while maintaining SRIC and load          47
+
+18   all approaches. Its average SRIC is higher by 3.41%, 1.11%,                           balancing  performance  that  remains  reasonably  close  to  it.          48
+
+19   31.88%, 9.64%, 16.67%, and 22.97% compared with MAPPO,                                Thisarisesfromitsconservativeschedulingpattern:MAQMIX          49
+
+20   MAQMIX, NichGPDRL, Greedy, Round Robin, and Random,                                   activates fewer instances and avoids aggressive scaling, which          50
+
+21   respectively. Statistical analysis shows that the SRIC differ-                        slightlylimitsservicecapacitybutsubstantiallyreducesenergy          51
+
+22   ences between H-MAR and MAPPO or MAQMIX are not                                       usage. In contrast, NichGPDRL exhibits the highest energy          52
+
+23   statistically signiﬁcant (p> 0.05), which aligns with their                           consumption and simultaneously underperforms on SRIC and          53
+
+24   close average SRIC values. In contrast, H-MAR outperforms                             load balancing. Its NichGP-evolved heuristics become unsta-          54
+
+25   NichGPDRL (p<  0.05), and exhibits signiﬁcant improve-                                ble in the more complex trace v2020 environment, leading          55
+
+26   ments over Greedy, Round Robin, and Random (p< 0.001),                                to oscillatory scheduling behavior that triggers unnecessary          56
+
+27   all  of  which  show  lower  SRIC.  In  terms  of  average  load                      instance  creation  and  inefﬁcient  resource  utilization.  The        57
+
+28   balancing  degree,  H-MAR  achieves  reductions  of  15.60%,                          higher energy consumption of H-MAR is primarily due to          58
+
+29   1.03%, 56.79%, 18.13%, 35.78%, and 39.57% compared with                               its  superior  SRIC  and  lower  load  balancing  degree,  which          59
+
+30   the same baselines. Statistical tests show that its differences                       improvesresourceutilizationbutalsoleadstoincreasedenergy          60
+
+31   from NichGPDRL, Round Robin, and Random are signiﬁcant                                consumption. Despite the greater computational demands of          61
+
+32   (p< 0.001), while the differences from MAPPO and Greedy                               trace v2020 posing challenges for all scheduling approaches,          62
+
+33   are also signiﬁcant (p< 0.05). The difference from MAQMIX                             H-MAR  consistently  delivers  the  highest  SRIC  while  opti-          63
+
+34   is not statistically signiﬁcant (p> 0.05), reﬂecting the simi-                        mizing resource utilization, further validating its scheduling          64
+
+35   larity in their load balancing performance.                                           advantages in distributed data centers.                                                                               65
+
+
+36      Fig.7(c)shows the average energy consumption of different
+37   approaches.  H-MAR  consumes  slightly  more  energy  than                            D. Effects of Collaboration and Agent Number                                                    66
+
+
+38   MAPPO (5.44%), Greedy (3.26%), Round Robin (11.70%),                                     Fig.8shows the evolution of local and cross-agent SRIC                         67
+
+39   and  Random  (8.04%),  and  much  more  than  MAQMIX                                  during  training  within  the  proposed  H-MAR  approach  on          68
+
+
+             Authorized licensed use limited to: Inner Mongolia University. Downloaded on March 04,2026 at 10:41:44 UTC from IEEE Xplore.  Restrictions apply.
+                           © 2026 IEEE. All rights reserved, including rights for text and data mining and training of artificial intelligence and similar technologies. Personal use is permitted,
+                                           but republication/redistribution requires IEEE permission. See https://www.ieee.org/publications/rights/index.html for more information.
+
+===== PDF PAGE 13 =====
+                           This article has been accepted for publication in IEEE Transactions on Services Computing. This is the author's version which has not been fully edited and
+                                                   content may change prior to final publication. Citation information: DOI 10.1109/TSC.2026.3656552
+
+                                                                                                                                                                               13
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                (a)                                                     (b)                                                      (c)
+     Fig. 9.  Performance comparison with different numbers of agents on trace v2018 and v2020.
+                                                                                             v2018,theaverageloadbalancingdegreedecreasesby21.13%          39
+                                                                                             when scaling from 3 to 12 agents. When the number of agents          40
+                                                                                             increases  to  51  and  102,  the  metric  increases  by  24.14%          41
+                                                                                             and 31.14%, respectively, indicating that the load balancing          42
+                                                                                             gain  saturates  at  large  scales  and  may  be  partially  offset          43
+                                                                                             when the infrastructure becomes overly fragmented relative          44
+                                                                                             to the workload. On trace v2020, the load balancing degree          45
+                 (a) Trace v2018                          (b) Trace v2020                    increases by 60.05% when the number of agents grows from          46
+     Fig. 10.  Convergence of H-MAR, H-MAR w/o Heuristic, H-MAR w/o Data                     3 to 9, reﬂecting worse balancing due to the concentration of           47
+     Augmentation, and MADSAC on trace v2018 and v2020.                                      high-demand computing services across data centers. As the          48
+                                                                                             system scales further, the metric decreases and shows partial          49
+1    the trace v2018 and v2020 datasets. The local SRIC refers
+                                                                                             recovery. Fig.9(c)compares the average energy consumption.                                 50
+2    to instances successfully executed by local virtual machines,
+                                                                                             On trace v2018, energy consumption decreases substantially          51
+3    whereasthecross-agentSRICreferstoinstancesexecutedafter
+                                                                                             by  28.93%  as  the  number  of  agents  grows  from  3  to  9          52
+4    being assigned to data centers managed by other agents. On
+                                                                                             and remains low at 12 agents. When scaling to 51 and 102          53
+5    both datasets, the local and cross-agent SRIC values increase
+                                                                                             agents, energy consumption increases by 16.29% and 20.58%,          54
+6    steadily as training progresses. Speciﬁcally, for trace v2018,
+                                                                                             respectively, indicating that excessive scaling can introduce          55
+7    the  local  SRIC  improves  by  28.91%  and  the  cross-agent
+                                                                                             additional energy overhead (e.g., more nodes kept active with          56
+8    SRIC by 81.45% relative to the initial stage. For trace v2020,
+                                                                                             non-negligible idle costs). On trace v2020, the lowest energy          57
+9    the  corresponding  improvements  are  41.23%  and  32.10%,
+                                                                                             consumption is achieved when the number of agents is 6 with          58
+10   respectively. These results indicate that as training progresses,
+                                                                                             a reduction of 17.29%. Overall, these results demonstrate the          59
+11   the proposed H-MAR approach enhances local resource allo-
+                                                                                             adaptabilityofH-MARtodifferentsystemscalesindistributed          60
+12   cation while effectively leveraging cross-agent collaboration
+                                                                                             data  centers,  further  validating  its  scalability  potential  and          61
+13   to address resource constraints and load imbalance issues. By
+                                                                                             practical limits under diverse workload conditions.                                          62
+14   combining local optimization with cross-agent collaboration,
+
+15   H-MAR  achieves  load  balancing  and  resource  complemen-                             E. Ablation Studies                                                                                                                                     63
+
+16   tarity across geographically distributed data centers, thereby                             Fig.10shows the convergence performance of H-MAR, H-                            64
+
+17   improving QoS and strengthening system robustness.                                      MAR w/o Heuristic, H-MAR w/o Data Augmentation, and          65
+
+18      Fig.9shows the performance of H-MAR when scaling the                                 MADSAC on the trace v2018 and v2020 datasets. As shown          66
+
+19   number of agents from 3 to 102 (multiples of 3 due to three                             in Fig.10(a), all approaches converge stably on trace v2018,                                    67
+
+20   types  of  data  centers)  on  trace  v2018  and  v2020  datasets.                      withH-MARachievingthehighestaveragerewardacrossmost          68
+
+21   As shown in Fig.9(a), the overall SRIC on trace v2020 is                                training episodes. After convergence, H-MAR outperforms H-          69
+
+22   consistently lower than that on trace v2018, mainly because                             MAR w/o Heuristic by 5.89%, H-MAR w/o Data Augmenta-          70
+
+23   jobs in v2020 have higher computational demands and are                                 tionby8.99%,andMADSACby10.00%.Similarly,Fig.10(b)                     71
+
+24   subject  to  stricter  SLA  constraints.  On  trace  v2018,  SRIC                       shows the performance on trace v2020, where the converged          72
+
+25   increases by 2.54% when the number of agents grows from 3                               average  reward  of  H-MAR  is  3.09%  higher  than  H-MAR          73
+
+26   to 9, and remains at a similar level when further increasing to                         w/o  Heuristic,  3.14%  higher  than  H-MAR  w/o  Data  Aug-          74
+
+27   12 agents. When scaling to 51 and 102 agents, SRIC decreases                            mentation, and 6.95% higher than MADSAC. The learning          75
+
+28   by 1.26% and 2.91% compared with the 12-agent setting. This                             curves show the different roles of heuristic guidance and data          76
+
+29   indicates that moderate scaling improves scheduling ﬂexibility,                         augmentation during the training process. In the early stage,          77
+
+30   while excessive scaling may weaken the learning signals of                              H-MAR and H-MAR w/o Data Augmentation achieve higher          78
+
+31   each  agent  and  increase  coordination  difﬁculty,  leading  to                       rewards than the other variants, as both incorporate heuristic          79
+
+32   performance saturation or slight degradation. On trace v2020,                           guidance. This indicates that the heuristic function provides          80
+
+33   SRIC achieves its best value at 6 agents, then ﬂuctuates and                            valuable  directional  information  that  enables  the  policy  to          81
+
+34   becomes  relatively  stable  as  the  number  of  agents  further                       more quickly reach high-quality regions of the solution space.          82
+
+35   increases. This shows that under more challenging workloads,                            Incontrast,dataaugmentationcontributesmoresigniﬁcantlyin        83
+
+36   simply increasing the number of agentsN does not monoton-                               the middle and later stages, where the diversiﬁed experiences        84
+
+37   ically improve SLA-related performance.                                                 help improve the generalization of policy updates. This staged          85
+
+38      Fig.9(b)shows the average load balancing degree. On trace                            interaction illustrates how the two components jointly shape          86
+
+
+             Authorized licensed use limited to: Inner Mongolia University. Downloaded on March 04,2026 at 10:41:44 UTC from IEEE Xplore.  Restrictions apply.
+                           © 2026 IEEE. All rights reserved, including rights for text and data mining and training of artificial intelligence and similar technologies. Personal use is permitted,
+                                            but republication/redistribution requires IEEE permission. See https://www.ieee.org/publications/rights/index.html for more information.
+
+===== PDF PAGE 14 =====
+                           This article has been accepted for publication in IEEE Transactions on Services Computing. This is the author's version which has not been fully edited and
+                                                   content may change prior to final publication. Citation information: DOI 10.1109/TSC.2026.3656552
+
+                                                                                                                                                                               14
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                (a)                                                     (b)                                                      (c)
+     Fig. 11.  Performance comparison of H-MAR, H-MAR w/o Heuristic, H-MAR w/o Data Augmentation, and MADSAC on trace v2018.
+
+
+
+
+
+
+
+
+
+
+
+                                (a)                                                     (b)                                                      (c)
+     Fig. 12.  Performance comparison of H-MAR, H-MAR w/o Heuristic, H-MAR w/o Data Augmentation, and MADSAC on trace v2020.
+
+
+1    the  learning  dynamics.  These  results  indicate  that  H-MAR                         v2020.  Compared  with  the  results  on  trace  v2018,  all  ap-          40
+
+2    maintains  robust  performance  across  traces  with  different                         proaches exhibit a slight decline in overall performance on          41
+
+3    workload characteristics and SLA constraints, and effectively                           v2020, where resource demands are higher, and SLA con-          42
+
+4    improves learning efﬁciency and convergence stability.                                  straints are stricter. Nevertheless, consistent with the results          43
+
+5       Fig.11shows the performance of H-MAR and its ablated                                 on trace v2018, H-MAR continues to perform personalized          44
+
+6    variants across three types of data centers on trace v2018.  In                         scheduling based on the optimization preferences of different          45
+
+7    Type-1 data centers, which prioritize SRIC, followed by load                            data center types and achieves more favorable trade-offs than          46
+
+8    balancingandenergyconsumption,H-MARachievesthehigh-                                     the  other  variants.  Speciﬁcally,  in  Type-1  data  centers,  the        47
+
+9    est SRIC and the lowest load balancing degree. Speciﬁcally,                             SRIC of H-MAR is 1.24% lower than that of H-MAR w/o          48
+
+10   H-MARimprovesSRICby0.18%overH-MARw/oHeuristic,                                          Data Augmentation, 0.66% higher than that of H-MAR w/o          49
+
+11   0.08%  over  H-MAR  w/o  Data  Augmentation,  and  1.27%                                Heuristic, and 1.22% higher than that of MADSAC. In Type-          50
+
+12   over MADSAC, while reducing the load balancing degree by                                2  data  centers,  it  achieves  the  lowest  energy  consumption,          51
+                                                                                             reducing it by 9.07% relative to H-MAR w/o Heuristic, 7.23%          52
+13   8.27%, 11.90%, and 11.49%, respectively. This improvement
+14   comes at the cost of relatively higher energy consumption. For                          relative  to  H-MAR  w/o  Data  Augmentation,  and  11.43%          53
+
+15   Type-2 and Type-3 data centers, where energy consumption                                relativetoMADSAC.InType-3datacenters,H-MARachieves          54
+
+16   and load balancing are prioritized, respectively, H-MAR effec-                          the lowest load balancing degree, lowering it by 6.87% relative          55
+
+17   tively aligns with the corresponding optimization objectives.                           to  H-MAR  w/o  Heuristic,  14.10%  relative  to  H-MAR  w/o          56
+
+18   In Type-2 data centers, H-MAR achieves the lowest average                               Data Augmentation, and 21.93% relative to MADSAC. The          57
+
+19   energy consumption, reducing it by 6.48% compared to H-                                 increased complexity of the v2020 environment poses greater          58
+
+20   MAR w/o Heuristic, 1.58% compared to H-MAR w/o Data                                     challenges for agents in capturing scheduling patterns. Under          59
+
+21   Augmentation, and 6.91% compared to MADSAC. In Type-                                    such conditions, heuristic guidance becomes particularly ben-          60
+
+22   3 data centers, H-MAR achieves the optimal load balancing                               eﬁcial as it provides structural prior knowledge, allowing H-        61
+
+23   degree, lowering it by 10.57% relative to H-MAR w/o Heuris-                             MAR to better optimize the priority objective of each data          62
+
+24   tic,  5.46%  compared  to  H-MAR  w/o  Data  Augmentation,                              center  type.  The  results  in  Figs.11and12conﬁrm  that                                         63
+
+25   and 18.12% relative to MADSAC. For each data center type,                               the  proposed  H-MAR  approach,  which  integrates  personal-          64
+
+26   the performance gap on the oriented objective between H-                                ized optimization, data augmentation, and heuristic guidance,          65
+
+27   MAR and H-MAR w/o Heuristic is consistently larger than                                 demonstratesstrongadaptabilityandefﬁciencyacrossdifferent        66
+
+28   that between H-MAR and H-MAR w/o Data Augmentation.                                     workload environments.                                                                                                                         67
+
+29   This indicates that heuristic guidance plays a more decisive                               The parameter sensitivity results with respect to key hyper-          68
+
+30   role in enabling personalized optimization for the priorities                           parametersofH-MARandthepracticaldeploymentdiscussion          69
+
+31   of each data center. These results indicate the capacity of H-                          for  distributed  data  centers  are  provided  in  Appendices  C          70
+
+32   MAR to perform personalized optimization by dynamically                                 and D, respectively.                                                                                                                                     71
+
+
+33   adjusting scheduling policies based on the speciﬁc preferences                                        VI.  CONCLUSION AND FUTURE WORK                                         72
+
+34   of  different  data  centers.  Furthermore,  the  combination  of                          In this paper, we propose H-MAR, a heuristic-guided multi-          73
+
+35   data  augmentation  and  heuristic  guidance  enables  H-MAR                            agent deep reinforcement learning approach for collaborative          74
+
+36   to consistently outperform other variants, demonstrating the
+                                                                                             computing service scheduling in distributed data centers. The          75
+37   efﬁciency and robustness of its collaborative scheduling policy                         scheduling  problem  is  formulated  as  a  personalized  multi-          76
+
+38   in achieving multi-objective optimization.                                              objective optimization task to capture the diverse operational          77
+
+
+39      Fig.12shows the corresponding ablation results on trace                              preferences across data centers. The proposed approach im-          78
+
+
+             Authorized licensed use limited to: Inner Mongolia University. Downloaded on March 04,2026 at 10:41:44 UTC from IEEE Xplore.  Restrictions apply.
+                           © 2026 IEEE. All rights reserved, including rights for text and data mining and training of artificial intelligence and similar technologies. Personal use is permitted,
+                                            but republication/redistribution requires IEEE permission. See https://www.ieee.org/publications/rights/index.html for more information.
+
+===== PDF PAGE 15 =====
+                                  This article has been accepted for publication in IEEE Transactions on Services Computing. This is the author's version which has not been fully edited and
+                                                                content may change prior to final publication. Citation information: DOI 10.1109/TSC.2026.3656552
+
+                                                                                                                                                                                                                            15
+
+
+
+
+
+ 1    proves learning efﬁciency and robustness by increasing effec-                                                  [13]J. Anselmi, “Combining size-based load balancing with round-robin for                    69
+ 2    tive training experience coverage through data augmentation                                                            scalable low latency,” IEEE Transactions on Parallel and Distributed          70
+                                                                                                                             Systems, vol. 31, no. 4, pp. 886–896, 2020.                                                                           71
+ 3    and  incorporating  heuristics  as  structured  priors  to  guide                                              [14]P.  Kumar  and  R.  Kumar,  “Issues  and  challenges  of  load  balancing                    72
+
+ 4    policy optimization. From a theoretical perspective, we further                                                        techniques in cloud computing: A survey,” ACM Computing Surveys,          73
+ 5    provide a modiﬁed Dec-POMDP formulation, where the per-                                                                vol. 51, no. 6, Feb. 2019.                                                                                                                      74
+                                                                                                                     [15]C. Gao, V. C. Lee, and K. Li, “D-srtf: Distributed shortest remaining                    75
+ 6    formance difference is decomposed into Gap and Offset terms                                                            time ﬁrst scheduling for data center networks,”IEEE Transactions on          76
+
+ 7    to justify the design choices of H-MAR. Extensive experi-                                                              Cloud Computing, vol. 9, no. 2, pp. 562–575, 2021.                                                      77
+
+ 8    ments on real-world Alibaba cluster traces show that H-MAR                                                     [16]H. Feng, T. Zhou, Y. Deng, and L. T. Yang, “A holistic energy-aware and                    78
+                                                                                                                             probabilistic determined vmp strategy for heterogeneous data centers,”          79
+ 9    outperforms baseline approaches in SRIC and load balancing,                                                            IEEE Transactions on Network and Service Management, vol. 21, no. 2,          80
+
+10    while  maintaining  energy  consumption  within  a  reasonable                                                         pp. 1852–1866, 2024.                                                                                                                              81
+
+11    range. Moreover, H-MAR exhibits strong adaptability under                                                      [17]N. Malik, M. Sardaraz, M. Tahir, B. Shah, G. Ali, and F. Moreira,                   82
+12    different  workload  conditions,  achieving  faster  convergence                                                       “Energy-efﬁcient load balancing algorithm for workﬂow scheduling in           83
+                                                                                                                             cloud  data  centers  using  queuing  and  thresholds,”  Applied  Sciences,          84
+13    and higher long-term rewards, which validates its effectiveness                                                        vol. 11, no. 13, 2021.                                                                                                                               85
+
+14    for intelligent and adaptive computing service provisioning.                                                   [18]Y. Liang, G. Li, J. Guo, Q. Liu, X. Zheng, and T. Wang, “Efﬁcient                   86
+15        For future work, we plan to extend H-MAR with explicit                                                             request scheduling in cross-regional edge collaboration via digital twin          87
+                                                                                                                             networks,” in 2024 IEEE/ACM 32nd International Symposium on Qual-          88
+16    latency and energy-aware modeling by integrating transmis-                                                             ity of Service (IWQoS), 2024, pp. 1–6.                                                                                      89
+
+17    sion  latency,  queuing  dynamics,  and  SLA  ﬂuctuations  into                                                [19]L. Bus¸oniu, R. Babu      ˇska, and B. De Schutter, “Multi-agent reinforcement           90
+18    the scheduling and migration logic. This will enable a more                                                            learning: An overview,” Springer Innovations in Multi-Agent Systems          91
+                                                                                                                             and Applications-1, vol. 310, 2010.                                                                                              92
+19    accurate  representation  of  cross-data  center  execution  costs                                             [20]A. Che, Z. Wang, and C. Zhou, “Multi-agent deep reinforcement learn-                    93
+
+20    beyond the current implicit reward formulation. Moreover, we                                                           ing for recharging-considered vehicle scheduling problem in container          94
+21    will make the personalized weights adaptive through online                                                             terminals,”  IEEE  Transactions  on  Intelligent  Transportation  Systems,          95
+                                                                                                                             vol. 25, no. 11, pp. 16855–16868, 2024.                                                                                96
+22    or meta-learning, allowing trade-off parameters to evolve with                                                 [21]M.  Goudarzi,  M.  Palaniswami,  and  R.  Buyya,  “A  distributed  deep                    97
+
+23    workload dynamics, energy conditions, and SLA constraints.                                                             reinforcement learning technique for application placement in edge and          98
+                                                                                                                             fogcomputingenvironments,”IEEETransactionsonMobileComputing,          99
+24                                             REFERENCES                                                                    vol. 22, no. 5, pp. 2491–2505, 2023.                                                                                         100
+
+25      [1]Y. Chai, K. Gao, G. Zhang, L. Lu, Q. Li, and Y. Zhang, “Joint task                                        [22]S. Wang, X. Li, H. Qu, and W. Chen, “State augmentation via self-                  101
+26            ofﬂoading, resource allocation and model placement for ai as a service                                         supervision in ofﬂine multiagent reinforcement learning,”  IEEE Trans-        102
+27            in 6g network,” IEEE Transactions on Services Computing, vol. 17,                                              actions on Cognitive and Developmental Systems, vol. 16, no. 3, pp.        103
+28            no. 6, pp. 3830–3843, 2024.                                                                                    1051–1062, 2024.                                                                                                                                     104
+29      [2]X. Tang, C. Cao, Y. Wang, S. Zhang, Y. Liu, M. Li, and T. He, “Comput-                                    [23]R. Zhang, Q. Zong, X. Zhang, L. Dou, and B. Tian, “Game of drones:                  105
+30            ing power network: The architecture of convergence of computing and                                            Multi-uav pursuit-evasion game with online motion planning by deep        106
+31            networking towards 6g requirement,” China Communications, vol. 18,                                             reinforcement learning,” IEEE Transactions on Neural Networks and        107
+32            no. 2, pp. 175–185, 2021.                                                                                      Learning Systems, vol. 34, no. 10, pp. 7900–7909, 2023.                                         108
+
+33      [3]S. Yukun, L. Bo, L. Junlin, H. Haonan, Z. Xing, P. Jing, and W. Wenbo,                                    [24]Z. Guo, Y. Wu, L. Wang, and J. Zhang, “Heuristic-based multi-agent                  109
+34            “Computing power network: A survey,” China Communications, vol. 21,                                            deep reinforcement learning approach for coordinating connected and        110
+35            no. 9, pp. 109–145, 2024.                                                                                      automated vehicles at non-signalized intersection,” IEEE Transactions        111
+36      [4]S. Chen, J. Li, Q. Yuan, H. He, S. Li, and J. Yang, “Two-timescale                                                onIntelligentTransportationSystems,vol.25,no.11,pp.16235–16248,        112
+37            joint optimization of task scheduling and resource scaling in multi-data                                       2024.                                                                                                                                                                   113
+
+38            center system based on multi-agent deep reinforcement learning,” IEEE                                  [25]C.-C. Hung, L. Golubchik, and M. Yu, “Scheduling jobs across geo-                  114
+39            Transactions on Parallel and Distributed Systems, vol. 35, no. 12, pp.                                         distributed datacenters,” in Proc. ACM SoCC, New York, NY, USA,        115
+40            2331–2346, 2024.                                                                                               2015, pp. 111–124.                                                                                                                                  116
+41      [5]B. Ma, X. Hu, Y. Pan, Q. Lu, and C. Li, “Optimizing proﬁt and delay                                       [26]P. Delgado, F. Dinu, A.-M. Kermarrec, and W. Zwaenepoel, “Hawk:                  117
+42            in computing power network via deep deterministic policy gradient: A                                           Hybrid datacenter scheduling,” in Proc. USENIX ATC, Santa Clara, CA,        118
+43            task decomposition and computing path optimization approach,” IEEE                                             jul. 2015, pp. 499–510.                                                                                                                        119
+44            Transactions on Services Computing, pp. 1–17, 2025.                                                    [27]Y. Xin, Z.-Q. Xie, and J. Yang, “A load balance oriented cost efﬁcient                 120
+45      [6]D. C. N. De Azevedo and C. A. G. Ferraz, “A survey on autonomic                                                   scheduling method for parallel tasks,” Journal of Network and Computer        121
+46            multi-cloud computing,” in Proc. IEEE CloudCom, Bangkok, Thailand,                                             Applications, vol. 81, pp. 37–46, 2017.                                                                                   122
+
+47            Dec. 2022, pp. 33–40.                                                                                  [28]X.  Li,  W.  Yu,  R.  Ruiz,  and  J.  Zhu,  “Energy-aware  cloud  workﬂow                    123
+48      [7]S. S. Mondal, N. Sheoran, and S. Mitra, “Scheduling of time-varying                                               applications scheduling with geo-distributed data,” IEEE Transactions        124
+49            workloads  using  reinforcement  learning,”  in  Proc.  AAAI,  California,                                     on Services Computing, vol. 15, no. 2, pp. 891–903, 2022.                                    125
+50            USA, May 2021, pp. 9000–9008.                                                                          [29]W.Zhang,X.Chen,andJ.Jiang,“Amulti-objectiveoptimizationmethod                  126
+51      [8]T.  Li,  S.  Ying,  Y.  Zhao,  and  J.  Shang,  “Batch  jobs  load  balancing                                     of initial virtual machine fault-tolerant placement for star topological        127
+52            scheduling in cloud computing using distributional reinforcement learn-                                        data  centers  of  cloud  systems,”  Tsinghua  Science  and  Technology,        128
+53            ing,” IEEE Transactions on Parallel and Distributed Systems, vol. 35,                                          vol. 26, no. 1, pp. 95–111, 2021.                                                                                                 129
+
+54            no. 1, pp. 169–185, 2024.                                                                              [30]X. Tang, W. Cao, H. Tang, T. Deng, J. Mei, Y. Liu, C. Shi, M. Xia, and                 130
+55      [9]L. Osmani, T. Kauppinen, M. Komu, and S. Tarkoma, “Multi-cloud                                                    Z. Zeng, “Cost-efﬁcient workﬂow scheduling algorithm for applications         131
+56            connectivity  for  kubernetes  in  5g  networks,”  IEEE  Communications                                        with deadline constraint on heterogeneous clouds,” IEEE Transactions        132
+57            Magazine, vol. 59, no. 10, pp. 42–47, 2021.                                                                    on Parallel and Distributed Systems, vol. 33, no. 9, pp. 2079–2092,        133
+58    [10]H.-W.  Tseng,  T.-T.  Yang,  K.-C.  Yang,  and  P.-S.  Chen,  “An  energy                                          2022.                                                                                                                                                                   134
+
+59            efﬁcient vm management scheme with power-law characteristic in video                                   [31]P. Kyriakis, J. Deshmukh, and P. Bogdan, “Pareto policy adaptation,” in                  135
+60            streaming data centers,” IEEE Transactions on Parallel and Distributed                                         Proc. ICLR, Virtual Conference, Jan. 2022.                                                                          136
+61            Systems, vol. 29, no. 2, pp. 297–311, 2018.                                                            [32]Y. Xiao, G. Ma, N. K. Ahmed, M. Capot      ˘a, T. L. Willke, S. Nazarian,        137
+62    [11]X. Zeng, S. Garg, M. Barika, S. Bista, D. Puthal, A. Y. Zomaya, and                                                and P. Bogdan, “End-to-end programmable computing systems,”  Com-        138
+63            R. Ranjan, “Detection of sla violation for big data analytics applications                                     munications Engineering, vol. 2, no. 1, p. 84, 2023.                                                     139
+64            in cloud,” IEEE Transactions on Computers, vol. 70, no. 5, pp. 746–758,                                [33]S. Duan, H. Ping, N. Kanakaris, X. Xiao, P. Kyriakis, N. K. Ahmed,                 140
+65            2021.                                                                                                          P. Zhang, G. Ma, M. Capot˘a, S. Nazarian, T. L. Willke, and P. Bogdan,        141
+66    [12]W. Guo, W. Tian, Y. Ye, L. Xu, and K. Wu, “Cloud resource scheduling                                               “A structure-aware framework for learning device placements on com-         142
+67            with deep reinforcement learning and imitation learning,” IEEE Internet                                        putation graphs,” in Proc. NeurIPS, Vancouver, Canada, Dec. 2024, pp.        143
+68            of Things Journal, vol. 8, no. 5, pp. 3576–3586, 2021.                                                         81748–81772.                                                                                                                                             144
+
+
+                 Authorized licensed use limited to: Inner Mongolia University. Downloaded on March 04,2026 at 10:41:44 UTC from IEEE Xplore.  Restrictions apply.
+                                  © 2026 IEEE. All rights reserved, including rights for text and data mining and training of artificial intelligence and similar technologies. Personal use is permitted,
+                                                       but republication/redistribution requires IEEE permission. See https://www.ieee.org/publications/rights/index.html for more information.
+
+===== PDF PAGE 16 =====
+                                This article has been accepted for publication in IEEE Transactions on Services Computing. This is the author's version which has not been fully edited and
+                                                            content may change prior to final publication. Citation information: DOI 10.1109/TSC.2026.3656552
+
+                                                                                                                                                                                                               16
+
+
+
+
+
+ 1    [34]H. Mao, M. Alizadeh, I. Menache, and S. Kandula, “Resource manage-                                  [56]P. Christodoulou, “Soft actor-critic for discrete action settings,”         arXiv          77
+ 2           ment with deep reinforcement learning,” in Proc. ACM HotNets, New                                       preprint arXiv:1910.07207, 2019.                                                                                                   78
+ 3           York, NY, USA, Nov. 2016, pp. 50–56.                                                             [57]J. Yang, J. Zhang, M. Xi, Y. Lei, and Y. Sun, “A deep reinforcement                    79
+ 4    [35]M. Cheng, J. Li, P. Bogdan, and S. Nazarian, “H        2o-cloud: A resource                                learning  algorithm  suitable  for  autonomous  vehicles:  Double  boot-          80
+ 5           and quality of service-aware task scheduling framework for warehouse-                                   strapped soft-actor–critic-discrete,”IEEE Transactions on Cognitive and          81
+ 6           scale data centers,” IEEE Transactions on Computer-Aided Design of                                      Developmental Systems, vol. 15, no. 4, pp. 2041–2052, 2023.                                82
+ 7           Integrated Circuits and Systems, vol. 39, no. 10, pp. 2925–2937, 2020.                           [58]J. Guan, G. Chen, J. Huang, Z. Li, L. Xiong, J. Hou, and A. Knoll,                   83
+ 8    [36]J. Zeng, D. Ding, K. Kang, H. Xie, and Q. Yin, “Adaptive drl-based                                         “A discrete soft actor-critic decision-making strategy with sample ﬁlter          84
+ 9           virtual  machine  consolidation  in  energy-efﬁcient  cloud  data  center,”                             for  freeway  autonomous  driving,”  IEEE  Transactions  on  Vehicular          85
+10           IEEE Transactions on Parallel and Distributed Systems, vol. 33, no. 11,                                 Technology, vol. 72, no. 2, pp. 2593–2598, 2023.                                                             86
+11           pp. 2991–3002, 2022.                                                                             [59]R. Ding, J. Chen, W. Wu, J. Liu, F. Gao, and X. Shen, “Packet routing in                    87
+12    [37]W.  Wei,  H.  Gu,  K.  Wang,  J.  Li,  X.  Zhang,  and  N.  Wang,  “Multi-                                 dynamicmulti-hopuavrelaynetwork:Amulti-agentlearningapproach,”          88
+13           dimensional resource allocation in distributed data centers using deep                                  IEEE Transactions on Vehicular Technology, vol. 71, no. 9, pp. 10059–          89
+14           reinforcement  learning,”  IEEE  Transactions  on  Network  and  Service                                10072, 2022.                                                                                                                                                  90
+15           Management, vol. 20, no. 2, pp. 1817–1829, 2023.                                                 [60]M. Xu, Y. Mei, F. Zhang, and M. Zhang, “Niching genetic programming                    91
+16    [38]X. Ma, H. Xu, H. Gao, M. Bian, and W. Hussain, “Real-time virtual                                          to learn actions for deep reinforcement learning in dynamic ﬂexible           92
+17           machine scheduling in industry iot network: A reinforcement learning                                    scheduling,” IEEE Transactions on Evolutionary Computation, pp. 1–1,          93
+18           method,” IEEE Transactions on Industrial Informatics, vol. 19, no. 2,                                   2024.                                                                                                                                                                     94
+
+19           pp. 2129–2139, 2023.                                                                                                              Yu  Zhao  is  currently  working  toward  the  Ph.D.
+20    [39]X. Zhao and C. Wu, “Large-scale machine learning cluster scheduling                                                                  degree  in  the  School  of  Computer  Science  and
+21           via multi-agent graph reinforcement learning,” IEEE Transactions on                                                               Technology,TongjiUniversity,Shanghai,China. Her
+22           Network and Service Management, vol. 19, no. 4, pp. 4962–4974, 2022.                                                              research interests include deep learning, multi-agent
+
+23    [40]A.  Jayanetti,  S.  Halgamuge,  and  R.  Buyya,  “Multi-agent  deep  rein-                                                           system, and network optimization.
+24           forcement  learning  framework  for  renewable  energy-aware  workﬂow
+25           scheduling on distributed cloud data centers,” IEEE Transactions on
+26           Parallel and Distributed Systems, vol. 35, no. 4, pp. 604–615, 2024.
+27    [41]Q.  Wang,  S.  Zou,  Y.  Sun,  M.  Liwang,  X.  Wang,  and  W.  Ni,  “To-
+28           ward intelligent and adaptive task scheduling for 6g: An intent-driven
+29           framework,”  IEEE  Transactions  on  Cognitive  Communications  and
+30           Networking, vol. 10, no. 5, pp. 1975–1988, 2024.
+31    [42]Y.  Sun,  Z.  Ding,  Y.  Yan,  Z.  Wang,  P.  Dehghanian,  and  W.-J.  Lee,                                                          Cheng Wang (Senior Member, IEEE) received the
+32           “Privacy-preserving energy sharing among cloud service providers via                                                              Ph.D.  degree  from  the  Department  of  Computer
+33           collaborativejobscheduling,”IEEETransactionsonSmartGrid,vol.16,                                                                   Science, Tongji University, in 2011. He is currently
+34           no. 2, pp. 1168–1180, 2025.                                                                                                       a Professor and Assistant Head with the School of
+
+35    [43]X. Huang, B. Lei, G. Ji, M. Wei, Y. Zhang, and Q. Shen, “Multi-agent                                                                 Computer Science and Technology, Tongji Univer-
+36           deep reinforcement learning-based incentive mechanism for computing                                                               sity, Shanghai, China. His research interests include
+37           power network,” in Proc. Springer ICENAT, W. Quan, Ed., Singapore,                                                                cyberspace security and network computing.
+38           2023, pp. 38–49.
+39    [44]J. Lang, X. Zheng, Y. Sun, and Z. Ding, “Online job scheduling for
+40           energy  cost  optimization  in  geo-distributed  data  centers  considering
+41           data locality: A multi-agent reinforcement learning approach,” in Proc.
+42           IEEE/IAS I&CPS Asia, Pattaya, Thailand, Jul. 2024, pp. 748–753.
+43    [45]Z.  Chen,  W.  Yi,  A.  S.  Alam,  and  A.  Nallanathan,  “Dynamic  task                                                             Chungang  Yan  received  the  Ph.D.  degree  from
+44           software caching-assisted computation ofﬂoading for multi-access edge                                                             Tongji  University,  Shanghai,  China,  in  2006.  She
+45           computing,” IEEE Transactions on Communications, vol. 70, no. 10, pp.                                                             is currently a professor with the School of Com-
+46           6950–6965, 2022.                                                                                                                  puter  Science  and  Technology,  Tongji  University,
+
+47    [46]M. Zhao, R. Zhang, Z. He, and K. Li, “Joint optimization of trajectory,                                                              Shanghai, China. She has authored or coauthored
+48           ofﬂoading, caching, and migration for uav-assisted mec,”  IEEE Trans-                                                             more than 100 papers in domestic and international
+49           actions on Mobile Computing, vol. 24, no. 3, pp. 1981–1998, 2025.                                                                 academic journals and conference proceedings. Her
+
+50    [47]Z. Zhang, C. Li, Y. Tao, R. Yang, H. Tang, and J. Xu, “Fuxi: A fault-                                                                current research interests include concurrent model
+51           tolerant  resource  management  and  job  scheduling  system  at  internet                                                        and algorithm, Petri net theory, formal veriﬁcation
+52           scale,” in Proc. VLDB, Hangzhou, China, Aug. 2014, pp. 1393–1404.                                                                 of software, and trusty theory on software process.
+53    [48]A. Verma, L. Pedrosa, M. Korupolu, D. Oppenheimer, E. Tune, and
+54           J. Wilkes, “Large-scale cluster management at google with borg,” in
+55           Proc. EuroSys, New York, NY, USA, Apr. 2015, pp. 1–17.
+56    [49]Y. Ran, X. Zhou, H. Hu, and Y. Wen, “Optimizing data center energy                                                                   Xiaoli Li is currently a Ph.D. candidate in School
+57           efﬁciency via event-driven deep reinforcement learning,”IEEE Trans-                                                               of  Mathematics,  Yangzhou  University,  Yangzhou,
+58           actions on Services Computing, vol. 16, no. 2, pp. 1296–1309, 2023.                                                               China, jointly cultivated at Nanyang Technological
+
+59    [50]F. A. Oliehoek, C. Amato       et al., “A concise introduction to decentralized                                                      University  in  Singapore.  Her  research  focuses  on
+60           pomdps,” Springer Briefs in Intelligent Systems, vol. 1, Jun. 2016.                                                               functional analysis and numerical analysis.
+61    [51]Y. Yang, G. Chen, J. HAO, and P.-A. Heng, “Sample-efﬁcient multiagent
+62           reinforcement learning with reset replay,” in Proc. ACM ICML, Vienna,
+63           Austria, Jul. 2024.
+
+64    [52]M. Laskin, K. Lee, A. Stooke, L. Pinto, P. Abbeel, and A. Srinivas,
+65           “Reinforcement  learning  with  augmented  data,”  in  Proc.  MIT  Press
+66           NeurIPS, Virtual Conference, Dec. 2020, pp. 19884–19895.
+
+67    [53]O. Chapelle, J. Weston, L. Bottou, and V. Vapnik, “Vicinal risk mini-
+68           mization,” in Proc. NeurIPS.   Cambridge, MA, USA: MIT Press, 2000,                                                               Changjun  Jiang  received  the  Ph.D.  degree  from
+69           pp. 395–401.                                                                                                                      the Institute of Automation, Chinese Academy of
+70    [54]Y.  Wu,  S.  Tang,  C.  Yu,  B.  Yang,  C.  Sun,  J.  Xiao,  H.  Wu,  and                                                            Sciences, Beijing, China, in 1995. He is currently
+71           J.Feng,“Taskschedulingingeo-distributedcomputing:Asurvey,” IEEE                                                                   the Leader of the Key Laboratory of the Ministry
+72           Transactions on Parallel and Distributed Systems, vol. 36, no. 10, pp.                                                            of  Education  for  Embedded  System  and  Service
+73           2073–2088, 2025.                                                                                                                  Computing, Tongji University, Shanghai, China. He
+74    [55]A. Y. Ng, D. Harada, and S. Russell, “Policy invariance under reward                                                                 isalsoanHonoraryProfessorwithBrunelUniversity
+75           transformations: Theory and application to reward shaping,” in Proc.                                                              London, Uxbridge, England. Dr. Jiang is also an IET
+76           ICML, vol. 99, 1999, pp. 278–287.                                                                                                 Fellow. He is an Academician of Chinese Academy
+                                                                                                                                               of Engineering.
+
+                Authorized licensed use limited to: Inner Mongolia University. Downloaded on March 04,2026 at 10:41:44 UTC from IEEE Xplore.  Restrictions apply.
+                                © 2026 IEEE. All rights reserved, including rights for text and data mining and training of artificial intelligence and similar technologies. Personal use is permitted,
+                                                    but republication/redistribution requires IEEE permission. See https://www.ieee.org/publications/rights/index.html for more information.

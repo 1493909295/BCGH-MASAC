@@ -1,6 +1,8 @@
 from __future__ import annotations
 from dataclasses import dataclass, asdict
 import math
+import sys
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 import numpy as np
@@ -387,58 +389,50 @@ class DiscreteMASAC:
     ##################### 辅助函数 ######################
     # 根据配置选择 pytorch 设备
     @staticmethod
+    @lru_cache(maxsize=None)
     def _resolve_device(configured_device: Optional[str],) -> torch.device:
-        # if configured_device is not None:
-        #     return torch.device(
-        #         configured_device
-        #     )
-        # if torch.cuda.is_available():
-        #     return torch.device("cuda")
-        # return torch.device("cpu")
-
-        # 没有显式指定设备时，默认选择第一张GPU。
-        device_name = (
-            "cuda:0"
-            if configured_device is None
-            else str(configured_device)
-        )
-
-        # 禁止设置为cpu，防止意外使用CPU训练。
-        if not device_name.startswith("cuda"):
-            raise ValueError(
-                f"当前项目要求只使用GPU训练，"
-                f"但配置的设备是：{device_name}"
-            )
-
-        # 检查当前PyTorch是否能够访问CUDA。
+        device = torch.device("cuda:0" if configured_device is None else str(configured_device))
+        if device.type != "cuda":
+            raise ValueError(f"当前项目要求只使用 GPU 训练，但配置的设备是：{device}")
         if not torch.cuda.is_available():
             raise RuntimeError(
-                "CUDA不可用，程序拒绝退回CPU训练。\n"
-                "请检查：\n"
-                "1. 是否安装了NVIDIA显卡驱动；\n"
-                "2. 当前环境是否安装了CUDA版PyTorch；\n"
-                "3. 运行程序时是否使用了正确的Conda环境。"
+                f"CUDA 不可用：Python={sys.executable}, PyTorch={torch.__version__}, "
+                f"CUDA={torch.version.cuda}。请检查 NVIDIA 驱动和 CUDA 版 PyTorch。"
             )
-
-        # 构造PyTorch设备对象。
-        device = torch.device(device_name)
-
-        # cuda没有显式编号时，默认使用第0张GPU。
-        gpu_index = (
-            0
-            if device.index is None
-            else int(device.index)
-        )
-
-        # 检查GPU编号是否存在。
+        gpu_index = torch.cuda.current_device() if device.index is None else device.index
         gpu_count = torch.cuda.device_count()
-
         if gpu_index >= gpu_count:
-            raise RuntimeError(
-                f"指定了GPU编号 {gpu_index}，"
-                f"但PyTorch只检测到 {gpu_count} 张GPU。"
+            raise RuntimeError(f"指定了 GPU 编号 {gpu_index}，但 PyTorch 只检测到 {gpu_count} 张 GPU。")
+        device = torch.device("cuda", gpu_index)
+        try:
+            # Use constants so the preflight leaves training random streams untouched.
+            with torch.inference_mode(False), torch.enable_grad():
+                x = torch.ones((8, 8), device=device, requires_grad=True)
+                weights = torch.full((8, 8), 0.125).to(device)
+                loss = (x @ weights).exp().log_softmax(dim=-1).square().mean()
+                loss.backward()
+                loss.detach().cpu()
+                torch.cuda.synchronize(device)
+        except (RuntimeError, OSError) as exc:
+            try:
+                gpu_name = torch.cuda.get_device_name(device)
+                capability = torch.cuda.get_device_capability(device)
+                architectures = torch.cuda.get_arch_list()
+            except RuntimeError:
+                gpu_name, capability, architectures = "unknown", None, []
+            message = (
+                f"CUDA 运算预检失败：device={device}, GPU={gpu_name}, CC={capability}, "
+                f"PyTorch={torch.__version__}, CUDA={torch.version.cuda}, 编译架构={architectures}。\n"
+                f"原因：{exc}\n请按《服务器端V100环境安装命令.txt》安装支持该 GPU 的 PyTorch 构建。"
+                f"\n当前 Python：{sys.executable}"
             )
-
+            if capability == (7, 0):
+                message += (
+                    "\nV100/V100S 使用 CUDA 12.6 构建；在没有运行训练的环境中执行：\n"
+                    "python -m pip install --upgrade torch==2.10.0+cu126 "
+                    "--index-url https://download.pytorch.org/whl/cu126"
+                )
+            raise RuntimeError(message) from exc
         return device
 
     # 把 ReplayBatch 中的 NumPy 数组转换成张量

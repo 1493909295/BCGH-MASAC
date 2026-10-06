@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+import sys
+from functools import lru_cache
 import os
 import time
 from dataclasses import asdict, dataclass
@@ -2205,34 +2207,50 @@ class LocalHostSAC:
         )
 
 
+@lru_cache(maxsize=None)
 def resolve_training_device(
     configured_device: Optional[str],
 ) -> torch.device:
-
-    device_name = "cuda:0" if configured_device is None else str(configured_device)
-
-    # 当前项目要求 GPU-only training。
-    if not device_name.startswith("cuda"):
-        raise ValueError("当前项目要求只使用 GPU 训练，" f"但配置的设备是：{device_name}")
-
+    device = torch.device("cuda:0" if configured_device is None else str(configured_device))
+    if device.type != "cuda":
+        raise ValueError(f"当前项目要求只使用 GPU 训练，但配置的设备是：{device}")
     if not torch.cuda.is_available():
         raise RuntimeError(
-            "CUDA 不可用，程序拒绝退回 CPU 训练。\n"
-            "请检查：\n"
-            "1. NVIDIA 驱动；\n"
-            "2. CUDA 版 PyTorch；\n"
-            "3. 当前 Conda / Python 环境。"
+            f"CUDA 不可用：Python={sys.executable}, PyTorch={torch.__version__}, "
+            f"CUDA={torch.version.cuda}。请检查 NVIDIA 驱动和 CUDA 版 PyTorch。"
         )
-
-    device = torch.device(device_name)
-
-    gpu_index = 0 if device.index is None else int(device.index)
-
+    gpu_index = torch.cuda.current_device() if device.index is None else device.index
     gpu_count = torch.cuda.device_count()
-
     if gpu_index >= gpu_count:
-        raise RuntimeError(
-            f"指定了 GPU 编号 {gpu_index}，" f"但 PyTorch 只检测到 {gpu_count} 张 GPU。"
+        raise RuntimeError(f"指定了 GPU 编号 {gpu_index}，但 PyTorch 只检测到 {gpu_count} 张 GPU。")
+    device = torch.device("cuda", gpu_index)
+    try:
+        # Use constants so the preflight leaves training random streams untouched.
+        with torch.inference_mode(False), torch.enable_grad():
+            x = torch.ones((8, 8), device=device, requires_grad=True)
+            weights = torch.full((8, 8), 0.125).to(device)
+            loss = (x @ weights).exp().log_softmax(dim=-1).square().mean()
+            loss.backward()
+            loss.detach().cpu()
+            torch.cuda.synchronize(device)
+    except (RuntimeError, OSError) as exc:
+        try:
+            gpu_name = torch.cuda.get_device_name(device)
+            capability = torch.cuda.get_device_capability(device)
+            architectures = torch.cuda.get_arch_list()
+        except RuntimeError:
+            gpu_name, capability, architectures = "unknown", None, []
+        message = (
+            f"CUDA 运算预检失败：device={device}, GPU={gpu_name}, CC={capability}, "
+            f"PyTorch={torch.__version__}, CUDA={torch.version.cuda}, 编译架构={architectures}。\n"
+            f"原因：{exc}\n请按《服务器端V100环境安装命令.txt》安装支持该 GPU 的 PyTorch 构建。"
+            f"\n当前 Python：{sys.executable}"
         )
-
+        if capability == (7, 0):
+            message += (
+                "\nV100/V100S 使用 CUDA 12.6 构建；在没有运行训练的环境中执行：\n"
+                "python -m pip install --upgrade torch==2.10.0+cu126 "
+                "--index-url https://download.pytorch.org/whl/cu126"
+            )
+        raise RuntimeError(message) from exc
     return device

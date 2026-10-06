@@ -12,6 +12,7 @@ if not __package__:
     __package__ = "schedulers.BCGH-MASAC"
 
 from .training_support import *
+from .h_masac_agent import resolve_training_device
 
 
 def train(
@@ -25,6 +26,8 @@ def train(
     validate_training_stage_config(train_config)
 
     validate_bcgh_feature_config(train_config)
+    for agent_config in (routing_masac_config, host_sac_config):
+        resolve_training_device(conf.DEVICE if agent_config is None else agent_config.device)
 
     bcgh_runtime_mode = get_bcgh_runtime_mode(train_config)
 
@@ -474,16 +477,17 @@ def train(
         flush=True,
     )
 
-    guidance_log = (
-        GuidanceDecisionLog(episode_log_csv_path.with_suffix(".guidance.jsonl"))
-        if guided_policy.enabled
-        else None
-    )
+    # 暂停引导决策 JSONL 日志；恢复时取消以下四处日志调用的注释。
+    # guidance_log = (
+    #     GuidanceDecisionLog(episode_log_csv_path.with_suffix(".guidance.jsonl"))
+    #     if guided_policy.enabled
+    #     else None
+    # )
     try:
         # 从 start_episode 训练到 num_episodes，包含最后一个 episode。
         for episode in range(int(start_episode), int(train_config.num_episodes) + 1):
-            if guidance_log is not None:
-                guidance_log.flush()
+            # if guidance_log is not None:
+            #     guidance_log.flush()
 
             ##################### 一轮 episode 开始前的准备 ####################
             # 根据配置决定当前 episode 使用哪个环境 seed
@@ -943,14 +947,14 @@ def train(
                 # Trainer 不再复制 action_type 推断逻辑。
                 # ==========================================================
 
-                if guidance_log is not None and action_source == "policy":
-                    guidance_log.record(
-                        episode=episode,
-                        decision=decision,
-                        policy=guided_policy,
-                        action=action,
-                        guidance_lambda=guidance_lambda,
-                    )
+                # if guidance_log is not None and action_source == "policy":
+                #     guidance_log.record(
+                #         episode=episode,
+                #         decision=decision,
+                #         policy=guided_policy,
+                #         action=action,
+                #         guidance_lambda=guidance_lambda,
+                #     )
 
                 routing_result, next_decision = collector.execute_and_record(
                     decision=decision,
@@ -1190,8 +1194,8 @@ def train(
                 best_episode_return = float(stats.episode_return)
 
     finally:
-        if guidance_log is not None:
-            guidance_log.close()
+        # if guidance_log is not None:
+        #     guidance_log.close()
         close_method = getattr(env, "close", None)
         if callable(close_method):
             close_method()

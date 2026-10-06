@@ -12,6 +12,7 @@ if not __package__:
     __package__ = "schedulers.H-MASAC"
 
 from .training_support import *
+from .h_masac_agent import resolve_training_device
 
 
 def train(
@@ -27,6 +28,11 @@ def train(
     Dict[str, LocalHostSAC],
 ]:
     validate_training_stage_config(train_config)
+    for agent_config in (routing_masac_config, host_sac_config):
+        resolve_training_device(
+            conf.DEVICE if agent_config is None else agent_config.device,
+            allow_cpu=bool(getattr(agent_config, "allow_cpu", False)),
+        )
     routing_observation_builder_type = routing_observation_builder_type or RoutingObservationBuilder
     routing_agent_type = routing_agent_type or RoutingMASAC
 
