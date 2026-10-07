@@ -1,5 +1,7 @@
 ## 总体流程描述
 
+新增 BCGH2-MASCA 后继状态奖励/折扣引导调度器，运行 `python -m schedulers.BCGH2-MASCA.train_bcgh2_masca`。方法、参数、评估和检查点规则见 [BCGH2-MASCA 使用说明](docs/BCGH2-MASCA/README.md)。
+
 V100/V100S 服务器请按 [GPU 环境安装说明](服务器端V100环境安装命令.txt) 安装支持显卡架构的 PyTorch。
 四个调度器在训练前检查实际 GPU 运算，失败时会给出当前构建信息及修复方法。
 

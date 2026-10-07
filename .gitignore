@@ -37,6 +37,14 @@ checkpoint/
 # Local data and environments
 # =============================================================================
 
+# Local environment archive, tests, documentation, and analysis files
+/MYENV1-linux.tar.gz
+/tests/
+/tmp/
+/doc/
+/docs/
+/analysis_outputs/
+
 # Local datasets are not uploaded with the source repository
 /dataset/
 

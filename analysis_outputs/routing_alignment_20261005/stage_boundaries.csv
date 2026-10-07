@@ -1,8 +1,0 @@
-﻿experiment,stage,original_start,original_end,rounds,relative_start,relative_end,lambda_start,lambda_end
-200-200-700,host_pretrain,1,200,200,-200,-1,0.0,0.0
-200-200-700,routing_train,201,400,200,0,199,0.3,1.0
-200-200-700,joint_finetune,401,1008,608,200,807,1.0,0.3921316165951359
-200-800,host_pretrain,1,200,200,-200,-1,0.0,0.0
-200-800,routing_train,201,1000,800,0,799,0.3,1.0
-500-500,host_pretrain,1,500,500,-500,-1,0.0,0.0
-500-500,routing_train,501,1000,500,0,499,0.3,1.0
