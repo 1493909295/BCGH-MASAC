@@ -25,11 +25,16 @@ win+r cmd
 scp -P 31210 "C:\DuYan\experiment\26-MA-5\MYENV1-linux.tar.gz" root@paas.183-175-12-11.nip.io:/workspace/algorithm/26-MA-5/
 
 mkdir -p "$HOME/envs/MYENV1"
+mkdir -p "$HOME/data/envs/MYENV1"
 
 tar -xzf /workspace/algorithm/26-MA-5/MYENV1-linux.tar.gz \
-  -C "$HOME/envs/MYENV1"
+ -C "$HOME/envs/MYENV1"
+tar -xzf /data/coding/26-MA-5/MYENV1-linux.tar.gz \
+ -C "$HOME/data/envs/MYENV1"
 
 source "$HOME/envs/MYENV1/bin/activate"
+source "$HOME/data/envs/MYENV1/bin/activate"
+
 
 安装tmux
 

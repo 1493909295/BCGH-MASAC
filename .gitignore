@@ -39,10 +39,12 @@ checkpoint/
 
 # Local environment archive, tests, documentation, and analysis files
 /MYENV1-linux.tar.gz
-/tests/
+/tests/*
+!/tests/test_mr_bcgh_masac.py
 /tmp/
 /doc/
-/docs/
+/docs/*
+!/docs/MR-BCGH-MASAC/
 /analysis_outputs/
 
 # Local datasets are not uploaded with the source repository

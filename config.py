@@ -12,7 +12,7 @@ HOST_DATASET_PATH = os.path.join(BASE_DIR, "./dataset/DC_dataset/node_info_df.cs
 NUM_DATACENTERS = 5          # 数据中心数量
 NUM_HOST = 100               # 全局生成的主机 (Host) 总数量
 NUM_JOBS = 2000              # 全局生成的任务 (Job) 总数量
-LAMBDA_RATE = 0.35           # LAMBDA_RATE 越大，任务到达越密集（时间间隔越短）
+LAMBDA_RATE = 0.45           # LAMBDA_RATE 越大，任务到达越密集（时间间隔越短）
 
 # DC 初始任务到达模式。只修改这一个参数即可切换：
 #   "uniform"       ：所有 Edge DC 等概率接收初始任务（原有行为）。
@@ -117,7 +117,7 @@ DEVICE = "cuda:0"
 
 
 # 训练基本参数
-Episodes = 1000        # 训练轮次
+Episodes = 800        # 训练轮次
 ReplyBuffer_Capacity = 200000           # 经验池容量
 Batch_Size = 512            # 采样批量
 Seed = 42           # 宇宙的终极答案
@@ -146,6 +146,14 @@ Checkpoint_Dir = "model/H-MASAC/checkpoints"
 Log_csv_Path = "result/H-MASAC/train_log.csv"
 H_MASAC_EPISODE_LOG_CSV_PATH = "result/H-MASAC/episode_log.csv"
 H_MASAC_DC_LOG_CSV_PATH = "result/H-MASAC/dc_log.csv"
+# MR-H-MASAC: independent routing SACs; default replay capacity is a total budget.
+MR_H_MASAC_CHECKPOINT_DIR = "model/MR-H-MASAC/checkpoints"
+MR_H_MASAC_EPISODE_LOG_CSV_PATH = "result/MR-H-MASAC/episode_log.csv"
+MR_H_MASAC_DC_LOG_CSV_PATH = "result/MR-H-MASAC/dc_log.csv"
+MR_H_MASAC_RESUME_CHECKPOINT = None
+MR_H_MASAC_ROUTING_REPLAY_TOTAL_CAPACITY = ROUTING_REPLAY_CAPACITY
+# None splits the total budget across DCs; an integer explicitly overrides each DC.
+MR_H_MASAC_ROUTING_REPLAY_CAPACITY_PER_DC = None
 BCGH_MASAC_CHECKPOINT_DIR = ("model/BCGH-MASAC/checkpoints")
 BCGH_MASAC_EPISODE_LOG_CSV_PATH = ("result/BCGH-MASAC/episode_log.csv")
 BCGH_MASAC_DC_LOG_CSV_PATH = ("result/BCGH-MASAC/dc_log.csv")
@@ -162,9 +170,17 @@ OPT_HOST_INIT_CHECKPOINT = None
 Old_Env_Path = None         #可选的旧环境文件路径,为 None 时，CloudEdgeEnv 会按自己的默认逻辑生成新环境
 Resume_Checkpoint = None         #可选的断点模型路径,为 None 表示从头训练。
 BCGH_MASAC_RESUME_CHECKPOINT = None  # BCGH-MASAC 只能从自己的 checkpoint 恢复。None 表示从头训练。
+
+# MR-BCGH-MASAC：每个 Edge DC 独立持有完整 Routing SAC。
+MR_BCGH_MASAC_CHECKPOINT_DIR = "model/MR-BCGH-MASAC/checkpoints"
+MR_BCGH_MASAC_EPISODE_LOG_CSV_PATH = "result/MR-BCGH-MASAC/episode_log.csv"
+MR_BCGH_MASAC_DC_LOG_CSV_PATH = "result/MR-BCGH-MASAC/dc_log.csv"
+MR_BCGH_MASAC_RESUME_CHECKPOINT = None
+# 容量按每个 DC 计算，总容量为 Edge DC 数量乘以下值。
+MR_BCGH_ROUTING_REPLAY_CAPACITY_PER_DC = ROUTING_REPLAY_CAPACITY
 Vary_Episode_Seed: bool = True          # 是否在每个 episode 使用不同但可复现的 seed
 
-HOST_PRETRAIN_EPISODES = 200    # host训练轮数
+HOST_PRETRAIN_EPISODES = 300    # host训练轮数
 ROUTING_TRAIN_EPISODES = 500    # routing训练轮数
 JOINT_FINETUNE_EPISODES = (Episodes - HOST_PRETRAIN_EPISODES - ROUTING_TRAIN_EPISODES)      #合并训练
 
@@ -250,6 +266,6 @@ BCGH_GUIDANCE_SCALE = 0.3             # Utility 转换为 logit bias 的尺度
 
 # 第 8 步：三阶段 Guidance λ 调度系数。
 # 实际 Bias = BCGH_GUIDANCE_SCALE × λ × centered_utility_bias。
-BCGH_GUIDANCE_LAMBDA_STAGE2_START = 0.3  # Routing Train 起始引导强度
+BCGH_GUIDANCE_LAMBDA_STAGE2_START = 1.0  # Routing Train 起始引导强度
 BCGH_GUIDANCE_LAMBDA_STAGE2_PEAK = 1.0   # Routing Train 结束/Joint 起始
-BCGH_GUIDANCE_LAMBDA_STAGE3_END = 0.3    # Joint Finetune 结束及评估引导强度
+BCGH_GUIDANCE_LAMBDA_STAGE3_END = 1.0    # Joint Finetune 结束及评估引导强度

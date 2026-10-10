@@ -1,4 +1,4 @@
-"""BCGH2-MASAC networks and routing/Host SAC agents."""
+"""MR-BCGH-MASAC networks and routing/Host SAC agents."""
 
 from __future__ import annotations
 
@@ -7,7 +7,8 @@ import sys
 from functools import lru_cache
 import os
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
+import copy
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Union
 
@@ -18,358 +19,78 @@ from torch.nn import functional as F
 
 import config as conf
 
-from .experience import (
-    HostReplayBatch,
-    HostReplayBuffer,
-    RoutingReplayBatch,
-    RoutingReplayBuffer,
-)
+from .experience import HostReplayBatch, HostReplayBuffer, RoutingReplayBatch, RoutingReplayBuffer
 
+# Network definitions
 DEFAULT_EPS = 1e-8
 
 
-def build_agent_one_hot(agent_indices: torch.Tensor, num_agents: int) -> torch.Tensor:
-
-    num_agents = int(num_agents)
-    agent_indices = agent_indices.to(dtype=torch.long)
-
-    one_hot = F.one_hot(
-        agent_indices,
-        num_classes=num_agents,
-    )
-    one_hot = one_hot.to(dtype=torch.float32)
-    return one_hot
-
-
 def initialize_linear_layer(layer: nn.Linear, gain: float = 1.0) -> None:
-
     nn.init.orthogonal_(layer.weight, gain=float(gain))
-
     if layer.bias is not None:
-        nn.init.constant_(
-            layer.bias,
-            0.0,
-        )
+        nn.init.constant_(layer.bias, 0.0)
 
 
 class RoutingDiscreteActor(nn.Module):
-    """
-    所有边缘智能体共用同一个 Actor。
-    为了让共享 Actor 知道当前是哪一个智能体在决策，
-    网络输入中除了 local_obs，还会拼接 agent one-hot。
+    """One DC's local policy; identity is supplied by network selection."""
 
-    网络输入 shape：
-        local_obs      -> (batch_size, local_obs_dim)
-        agent_indices  -> (batch_size,)
-
-    网络输出 shape：
-        logits         -> (batch_size, action_dim)       网络原始偏好分数
-        probabilities  -> (batch_size, action_dim)       动作概率
-    """
-
-    def __init__(
-        self,
-        local_obs_dim: int,
-        action_dim: int,
-        num_agents: int,
-        hidden_dim: int = conf.ROUTING_ACTOR_HIDDEN_DIM,
-    ) -> None:
+    def __init__(self, local_obs_dim, action_dim, num_agents,
+                 hidden_dim=conf.ROUTING_ACTOR_HIDDEN_DIM):
         super().__init__()
+        self.local_obs_dim = int(local_obs_dim)
+        self.action_dim = int(action_dim)
+        self.fc1 = nn.Linear(self.local_obs_dim, int(hidden_dim))
+        self.fc2 = nn.Linear(int(hidden_dim), int(hidden_dim))
+        self.output_layer = nn.Linear(int(hidden_dim), self.action_dim)
+        initialize_linear_layer(self.fc1, nn.init.calculate_gain("relu"))
+        initialize_linear_layer(self.fc2, nn.init.calculate_gain("relu"))
+        initialize_linear_layer(self.output_layer, conf.ROUTING_ACTOR_GAIN)
 
-        local_obs_dim = int(local_obs_dim)
-        action_dim = int(action_dim)
-        num_agents = int(num_agents)
-        hidden_dim = int(hidden_dim)
+    def forward(self, local_obs, agent_indices=None):
+        return self.output_layer(F.relu(self.fc2(F.relu(self.fc1(local_obs)))))
 
-        self.local_obs_dim = local_obs_dim
-        self.action_dim = action_dim
-        self.num_agents = num_agents
-        self.hidden_dim = hidden_dim
+    def get_policy(self, local_obs, agent_indices=None, eps=DEFAULT_EPS):
+        logits = self.forward(local_obs)
+        probabilities = F.softmax(logits, dim=-1)
+        return probabilities, torch.log(probabilities.clamp_min(float(eps))), logits
 
-        actor_input_dim = local_obs_dim + num_agents
-
-        self.fc1 = nn.Linear(actor_input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.output_layer = nn.Linear(hidden_dim, action_dim)
-
-        initialize_linear_layer(self.fc1, gain=nn.init.calculate_gain("relu"))
-        initialize_linear_layer(self.fc2, gain=nn.init.calculate_gain("relu"))
-        initialize_linear_layer(
-            self.output_layer,
-            gain=conf.ROUTING_ACTOR_GAIN,
-        )
-
-    def forward(
-        self, local_obs: torch.Tensor, agent_indices: torch.Tensor
-    ) -> torch.Tensor:
-
-        agent_one_hot = build_agent_one_hot(
-            agent_indices=agent_indices, num_agents=self.num_agents
-        )
-
-        agent_one_hot = agent_one_hot.to(device=local_obs.device)
-
-        agent_one_hot = agent_one_hot.to(dtype=local_obs.dtype)
-
-        actor_input = torch.cat([local_obs, agent_one_hot], dim=-1)
-
-        hidden = F.relu(self.fc1(actor_input))
-        hidden = F.relu(self.fc2(hidden))
-
-        logits = self.output_layer(hidden)
-
-        return logits
-
-    def get_policy(
-        self,
-        local_obs: torch.Tensor,
-        agent_indices: torch.Tensor,
-        eps: float = DEFAULT_EPS,
-    ) -> Tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
-        logits = self.forward(
-            local_obs=local_obs,
-            agent_indices=agent_indices,
-        )
-
-        action_probs = F.softmax(
-            logits,
-            dim=-1,
-        )
-
-        action_log_probs = torch.log(action_probs.clamp_min(float(eps)))
-
-        return (
-            action_probs,
-            action_log_probs,
-            logits,
-        )
-
-    def sample_action(
-        self,
-        local_obs: torch.Tensor,
-        agent_indices: torch.Tensor,
-    ) -> Tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
-
-        action_probs, action_log_probs, _ = self.get_policy(
-            local_obs=local_obs,
-            agent_indices=agent_indices,
-        )
-
-        distribution = torch.distributions.Categorical(probs=action_probs)
-
-        sampled_actions = distribution.sample()
-
-        selected_log_probs = action_log_probs.gather(
-            dim=1,
-            index=sampled_actions.unsqueeze(1),
-        ).squeeze(1)
-
-        return (
-            sampled_actions,
-            selected_log_probs,
-            action_probs,
-            action_log_probs,
-        )
+    def sample_action(self, local_obs, agent_indices=None):
+        probabilities, log_probabilities, _ = self.get_policy(local_obs)
+        actions = torch.distributions.Categorical(probs=probabilities).sample()
+        selected = log_probabilities.gather(1, actions.unsqueeze(1)).squeeze(1)
+        return actions, selected, probabilities, log_probabilities
 
 
 class RoutingDiscreteQNetwork(nn.Module):
-    """
-    Routing MASAC 的 centralized discrete Q network。
+    """One DC's centralized Q network, without an agent one-hot input."""
 
-    输入：
-        global_state
-            CTDE 训练阶段的 Routing centralized state
-
-        agent_indices
-            当前正在做 Routing decision 的 Edge DC identity
-
-    网络内部：
-        global_state
-            +
-        agent one-hot
-
-    输出：
-        当前 Routing Agent 对全部 Routing actions 的 Q values。
-
-    注意：
-        1. 这是 Routing 层 Critic；
-        2. 不属于 Local Host SAC；
-        3. 不读取 Host Observation；
-        4. 不与任何 LocalHostQNetwork 共享参数。
-    """
-
-    def __init__(
-        self,
-        global_state_dim: int,
-        action_dim: int,
-        num_agents: int,
-        hidden_dim: int = conf.ROUTING_CRITIC_HIDDEN_DIM,
-    ) -> None:
+    def __init__(self, global_state_dim, action_dim, num_agents,
+                 hidden_dim=conf.ROUTING_CRITIC_HIDDEN_DIM):
         super().__init__()
+        self.fc1 = nn.Linear(int(global_state_dim), int(hidden_dim))
+        self.fc2 = nn.Linear(int(hidden_dim), int(hidden_dim))
+        self.output_layer = nn.Linear(int(hidden_dim), int(action_dim))
+        initialize_linear_layer(self.fc1, nn.init.calculate_gain("relu"))
+        initialize_linear_layer(self.fc2, nn.init.calculate_gain("relu"))
+        initialize_linear_layer(self.output_layer, conf.ROUTING_CRITIC_GAIN)
 
-        self.global_state_dim = int(global_state_dim)
-
-        self.action_dim = int(action_dim)
-
-        self.num_agents = int(num_agents)
-
-        self.hidden_dim = int(hidden_dim)
-
-        if self.global_state_dim <= 0:
-            raise ValueError("Routing global_state_dim 必须 > 0")
-
-        if self.action_dim <= 0:
-            raise ValueError("Routing action_dim 必须 > 0")
-
-        if self.num_agents <= 0:
-            raise ValueError("Routing num_agents 必须 > 0")
-
-        critic_input_dim = self.global_state_dim + self.num_agents
-
-        self.fc1 = nn.Linear(
-            critic_input_dim,
-            self.hidden_dim,
-        )
-
-        self.fc2 = nn.Linear(
-            self.hidden_dim,
-            self.hidden_dim,
-        )
-
-        self.output_layer = nn.Linear(
-            self.hidden_dim,
-            self.action_dim,
-        )
-
-        initialize_linear_layer(
-            self.fc1,
-            gain=nn.init.calculate_gain("relu"),
-        )
-
-        initialize_linear_layer(
-            self.fc2,
-            gain=nn.init.calculate_gain("relu"),
-        )
-
-        initialize_linear_layer(
-            self.output_layer,
-            gain=conf.ROUTING_CRITIC_GAIN,
-        )
-
-    def forward(
-        self,
-        global_state: torch.Tensor,
-        agent_indices: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        返回当前 Routing Agent 对全部 Routing actions
-        的 centralized Q values。
-        """
-
-        agent_one_hot = build_agent_one_hot(
-            agent_indices=(agent_indices),
-            num_agents=(self.num_agents),
-        )
-
-        agent_one_hot = agent_one_hot.to(
-            device=global_state.device,
-            dtype=global_state.dtype,
-        )
-
-        critic_input = torch.cat(
-            [
-                global_state,
-                agent_one_hot,
-            ],
-            dim=-1,
-        )
-
-        hidden = F.relu(self.fc1(critic_input))
-
-        hidden = F.relu(self.fc2(hidden))
-
-        return self.output_layer(hidden)
+    def forward(self, global_state, agent_indices=None):
+        return self.output_layer(F.relu(self.fc2(F.relu(self.fc1(global_state)))))
 
 
 class RoutingTwinDiscreteCritic(nn.Module):
-    """
-    Routing MASAC 的 centralized Twin-Q Critic。
-
-    两个 Q 网络：
-
-        Q1(global_state, agent_id)
-        Q2(global_state, agent_id)
-
-    完全服务于 Routing MASAC + CTDE。
-
-    不与任何 Local Host SAC Critic 共享：
-        - 参数
-        - Optimizer
-        - Target Critic
-        - ReplayBuffer
-    """
-
-    def __init__(
-        self,
-        global_state_dim: int,
-        action_dim: int,
-        num_agents: int,
-        hidden_dim: int = conf.ROUTING_CRITIC_HIDDEN_DIM,
-    ) -> None:
+    def __init__(self, global_state_dim, action_dim, num_agents,
+                 hidden_dim=conf.ROUTING_CRITIC_HIDDEN_DIM):
         super().__init__()
+        self.q1 = RoutingDiscreteQNetwork(global_state_dim, action_dim, num_agents, hidden_dim)
+        self.q2 = RoutingDiscreteQNetwork(global_state_dim, action_dim, num_agents, hidden_dim)
 
-        self.q1 = RoutingDiscreteQNetwork(
-            global_state_dim=(global_state_dim),
-            action_dim=(action_dim),
-            num_agents=(num_agents),
-            hidden_dim=(hidden_dim),
-        )
-
-        self.q2 = RoutingDiscreteQNetwork(
-            global_state_dim=(global_state_dim),
-            action_dim=(action_dim),
-            num_agents=(num_agents),
-            hidden_dim=(hidden_dim),
-        )
-
-    def forward(
-        self,
-        global_state: torch.Tensor,
-        agent_indices: torch.Tensor,
-    ) -> Tuple[
-        torch.Tensor,
-        torch.Tensor,
-    ]:
-        """
-        同时返回 Q1 / Q2 对全部 Routing actions 的估计。
-        """
-
-        q1_values = self.q1(
-            global_state=(global_state),
-            agent_indices=(agent_indices),
-        )
-
-        q2_values = self.q2(
-            global_state=(global_state),
-            agent_indices=(agent_indices),
-        )
-
-        return (
-            q1_values,
-            q2_values,
-        )
+    def forward(self, global_state, agent_indices=None):
+        return self.q1(global_state), self.q2(global_state)
 
 
 def hard_update(target_network: nn.Module, source_network: nn.Module) -> None:
+    # state_dict 中包含网络全部可训练参数和缓冲区
     target_network.load_state_dict(source_network.state_dict())
 
 
@@ -381,10 +102,12 @@ def soft_update(
 
     tau = float(tau)
     with torch.no_grad():
+        # 同时遍历目标网络和源网络的对应参数。
         for target_parameter, source_parameter in zip(
             target_network.parameters(),
             source_network.parameters(),
         ):
+            # 原地执行加权平均。
             target_parameter.mul_(1.0 - tau)
             target_parameter.add_(
                 source_parameter,
@@ -592,6 +315,7 @@ class LocalHostTwinCritic(nn.Module):
         )
 
 
+# Agent definitions and checkpoint persistence
 _CHECKPOINT_RETRYABLE_WINDOWS_ERROR_CODES = {
     5,  # 目标文件被映射/扫描时，Windows 也可能返回“拒绝访问”
     32,  # 文件正被其他进程使用
@@ -669,15 +393,13 @@ def _atomic_torch_save(
 
     def build_temporary_path(attempt_index: int) -> Path:
         return target_path.with_name(
-            f".{target_path.name}."
-            f"{os.getpid()}."
-            f"{time.time_ns()}."
-            f"{attempt_index}.tmp"
+            f".{target_path.name}." f"{os.getpid()}." f"{time.time_ns()}." f"{attempt_index}.tmp"
         )
 
     temporary_path = build_temporary_path(0)
 
     try:
+        # 唯一临时文件本身也可能被安全软件抢占；写入失败时换一个名字重试。
         for attempt_index in range(max_attempts):
             temporary_path = build_temporary_path(attempt_index)
 
@@ -695,16 +417,13 @@ def _atomic_torch_save(
                 except OSError:
                     pass
 
-                if (
-                    not _is_retryable_checkpoint_error(error)
-                    or attempt_index + 1 >= max_attempts
-                ):
-                    raise RuntimeError(
-                        "Checkpoint 临时文件写入失败：" f"{target_path}"
-                    ) from error
+                if not _is_retryable_checkpoint_error(error) or attempt_index + 1 >= max_attempts:
+                    raise RuntimeError("Checkpoint 临时文件写入失败：" f"{target_path}") from error
 
                 time.sleep(retry_delay_seconds * float(attempt_index + 1))
 
+        # 临时文件已经完整落盘。目标被映射占用时只重试原子替换，
+        # 不重复序列化大型模型。
         for attempt_index in range(max_attempts):
             try:
                 os.replace(
@@ -713,22 +432,15 @@ def _atomic_torch_save(
                 )
 
                 if not target_path.is_file() or target_path.stat().st_size <= 0:
-                    raise RuntimeError(
-                        "Checkpoint 原子写入后文件不存在或为空：" f"{target_path}"
-                    )
+                    raise RuntimeError("Checkpoint 原子写入后文件不存在或为空：" f"{target_path}")
 
                 return
 
             except (OSError, RuntimeError) as error:
                 last_error = error
 
-                if (
-                    not _is_retryable_checkpoint_error(error)
-                    or attempt_index + 1 >= max_attempts
-                ):
-                    raise RuntimeError(
-                        "Checkpoint 原子替换失败：" f"{target_path}"
-                    ) from error
+                if not _is_retryable_checkpoint_error(error) or attempt_index + 1 >= max_attempts:
+                    raise RuntimeError("Checkpoint 原子替换失败：" f"{target_path}") from error
 
                 time.sleep(retry_delay_seconds * float(attempt_index + 1))
 
@@ -736,6 +448,8 @@ def _atomic_torch_save(
         try:
             temporary_path.unlink(missing_ok=True)
         except OSError:
+            # 临时文件也可能被安全软件短暂占用；它不会被当作正式
+            # checkpoint，后续启动不读取该文件。
             pass
 
     raise RuntimeError("Checkpoint 保存失败：" f"{target_path}") from last_error
@@ -770,13 +484,11 @@ def atomic_checkpoint_text_write(
 
     def build_temporary_path(attempt_index: int) -> Path:
         return target_path.with_name(
-            f".{target_path.name}."
-            f"{os.getpid()}."
-            f"{time.time_ns()}."
-            f"{attempt_index}.tmp"
+            f".{target_path.name}." f"{os.getpid()}." f"{time.time_ns()}." f"{attempt_index}.tmp"
         )
 
     try:
+        # 先完整写入同目录唯一文件，避免直接截断仍被映射的正式 JSON。
         for attempt_index in range(max_attempts):
             temporary_path = build_temporary_path(attempt_index)
             temporary_paths.append(temporary_path)
@@ -802,10 +514,7 @@ def atomic_checkpoint_text_write(
                 except OSError:
                     pass
 
-                if (
-                    not _is_retryable_checkpoint_error(error)
-                    or attempt_index + 1 >= max_attempts
-                ):
+                if not _is_retryable_checkpoint_error(error) or attempt_index + 1 >= max_attempts:
                     raise RuntimeError(
                         "Checkpoint 文本临时文件写入失败：" f"{target_path}"
                     ) from error
@@ -815,6 +524,7 @@ def atomic_checkpoint_text_write(
         if temporary_path is None:
             raise RuntimeError("Checkpoint 文本临时文件未创建：" f"{target_path}")
 
+        # 目标 JSON 被 PyCharm、索引器或安全软件占用时，只重试替换。
         for attempt_index in range(max_attempts):
             try:
                 os.replace(
@@ -831,13 +541,8 @@ def atomic_checkpoint_text_write(
             except (OSError, RuntimeError) as error:
                 last_error = error
 
-                if (
-                    not _is_retryable_checkpoint_error(error)
-                    or attempt_index + 1 >= max_attempts
-                ):
-                    raise RuntimeError(
-                        "Checkpoint 文本原子替换失败：" f"{target_path}"
-                    ) from error
+                if not _is_retryable_checkpoint_error(error) or attempt_index + 1 >= max_attempts:
+                    raise RuntimeError("Checkpoint 文本原子替换失败：" f"{target_path}") from error
 
                 time.sleep(retry_delay_seconds * float(attempt_index + 1))
 
@@ -853,10 +558,6 @@ def atomic_checkpoint_text_write(
 
 @dataclass(frozen=True)
 class RoutingMASACConfig:
-    enable_heuristic_guidance: bool = True
-    enable_reward_shaping: bool = True
-    enable_discount_reduction: bool = True
-    heuristic_beta: float = 0.98
     gamma: float = 0.99
     tau: float = 0.005
 
@@ -909,12 +610,12 @@ class HostSACConfig:
 
 @dataclass(frozen=True)
 class RoutingTensorBatch:
-    next_heuristic_scores: torch.Tensor
-    heuristic_valid: torch.Tensor
     agent_indices: torch.Tensor
 
+    # Routing Actor input
     local_obs: torch.Tensor
 
+    # CTDE Routing Critic input
     global_states: torch.Tensor
 
     actions: torch.Tensor
@@ -928,6 +629,8 @@ class RoutingTensorBatch:
     truncated: torch.Tensor
     done: torch.Tensor
 
+    # 当前 RoutingReplayBuffer 已不保存 forced transition，
+    # 暂时保留该字段以兼容现有训练检查接口。
     is_forced_action: torch.Tensor
 
 
@@ -954,48 +657,15 @@ class HostTensorBatch:
     done: torch.Tensor
 
 
-def validate_routing_guidance(config):
-    if not math.isfinite(config.heuristic_beta) or not 0 <= config.heuristic_beta <= 1:
-        raise ValueError("heuristic_beta must be in [0, 1]")
-    if not math.isfinite(config.gamma) or not 0 <= config.gamma < 1:
-        raise ValueError("Routing gamma must be in [0, 1)")
-
-
-def routing_td_target(
-    rewards, scores, done, next_soft_value, config, valid=None, *, validate=True
-):
-    """H-MAR-style target on immutable same-job successor scores."""
-    validate_routing_guidance(config)
-    if validate:
-        if valid is not None and not bool(valid.all()):
-            raise ValueError("Missing captured routing heuristic score")
-        if not bool(torch.isfinite(scores).all()):
-            raise ValueError("Non-finite routing heuristic score")
-        if bool((scores[done.to(dtype=torch.bool)] != 0).any()):
-            raise ValueError("Terminal routing heuristic must be zero")
-    enabled = config.enable_heuristic_guidance
-    gamma = float(config.gamma)
-    beta = float(config.heuristic_beta)
-    bonus = (
-        gamma * (1 - beta) * scores
-        if enabled and config.enable_reward_shaping
-        else torch.zeros_like(rewards)
-    )
-    effective_gamma = (
-        gamma * beta if enabled and config.enable_discount_reduction else gamma
-    )
-    modified = rewards + bonus
-    target = modified + effective_gamma * (1 - done) * next_soft_value
-    return target, bonus, modified, effective_gamma
-
-
-class RoutingMASAC:
+class LocalRoutingMASAC:
     def __init__(
         self,
         local_obs_dim: int,
         global_state_dim: int,
         action_dim: int,
         num_agents: int,
+        dc_id: str,
+        agent_index: int,
         config: Optional[RoutingMASACConfig] = None,
     ) -> None:
 
@@ -1004,23 +674,28 @@ class RoutingMASAC:
         action_dim = int(action_dim)
         num_agents = int(num_agents)
 
+        # 未传入配置时创建默认配置
         if config is None:
             config = RoutingMASACConfig()
         self.config = config
+        self.dc_id = str(dc_id)
+        self.agent_index = int(agent_index)
 
         self.local_obs_dim = local_obs_dim
         self.global_state_dim = global_state_dim
-        validate_routing_guidance(config)
         self.action_dim = action_dim
         self.num_agents = num_agents
 
         self.device = resolve_training_device(config.device)
 
+        # 若用户提供随机种子，则设置 PyTorch 随机种子
         if config.seed is not None:
             torch.manual_seed(int(config.seed))
+            # CUDA 存在时同时设置全部 CUDA 设备随机种子
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(int(config.seed))
 
+        # 创建当前 DC 的独立 Actor
         self.actor = RoutingDiscreteActor(
             local_obs_dim=local_obs_dim,
             action_dim=action_dim,
@@ -1028,6 +703,7 @@ class RoutingMASAC:
             hidden_dim=config.actor_hidden_dim,
         ).to(self.device)
 
+        # 创建在线双 Critic
         self.critic = RoutingTwinDiscreteCritic(
             global_state_dim=(global_state_dim),
             action_dim=(action_dim),
@@ -1035,6 +711,7 @@ class RoutingMASAC:
             hidden_dim=(config.critic_hidden_dim),
         ).to(self.device)
 
+        # 创建目标双 Critic
         self.target_critic = RoutingTwinDiscreteCritic(
             global_state_dim=(global_state_dim),
             action_dim=(action_dim),
@@ -1042,24 +719,31 @@ class RoutingMASAC:
             hidden_dim=(config.critic_hidden_dim),
         ).to(self.device)
 
+        # 初始化时让目标 Critic 参数完全等于在线 Critic
         hard_update(
             target_network=self.target_critic,
             source_network=self.critic,
         )
 
+        # 目标 Critic 不参与梯度更新
         for parameter in self.target_critic.parameters():
             parameter.requires_grad_(False)
 
+        # 创建 Actor 优化器
         self.actor_optimizer = torch.optim.Adam(
             self.actor.parameters(),
             lr=float(config.actor_lr),
         )
 
+        # 创建 Critic 优化器
+        # TwinDiscreteCritic.parameters() 会包含 Q1 和 Q2 的参数
         self.critic_optimizer = torch.optim.Adam(
             self.critic.parameters(),
             lr=float(config.critic_lr),
         )
 
+        # SAC 中 alpha 必须保持正数
+        # 因此不直接优化 alpha，而是优化 log_alpha
         self.log_alpha = torch.tensor(
             math.log(float(config.initial_alpha)),
             dtype=torch.float32,
@@ -1067,17 +751,21 @@ class RoutingMASAC:
             requires_grad=True,
         )
 
+        # alpha 优化器只更新 log_alpha 这一个张量
         self.alpha_optimizer = torch.optim.Adam(
             [self.log_alpha],
             lr=float(config.alpha_lr),
         )
 
+        # 记录已经执行了多少次网络更新
         self.update_step = 0
 
+    # 返回当前温度系数 alpha
     @property
     def alpha(self) -> torch.Tensor:
         return self.log_alpha.exp()
 
+    # 根据单条环境观测选择一个普通动作
     def select_action(
         self,
         local_obs: np.ndarray,
@@ -1097,6 +785,8 @@ class RoutingMASAC:
         ).copy()
 
         agent_index = int(agent_index)
+        if agent_index != self.agent_index:
+            raise ValueError("Routing learner identity mismatch")
 
         local_obs_tensor = torch.as_tensor(
             local_obs_array,
@@ -1132,23 +822,31 @@ class RoutingMASAC:
 
         return int(action_tensor.item())
 
+    # 从 ReplayBuffer 采样并执行一次完整 SAC 更新
     def update(
         self,
         replay_buffer: RoutingReplayBuffer,
         batch_size: int,
+        next_value_provider,
     ) -> Dict[str, float]:
         batch_size = int(batch_size)
 
+        # 默认排除环境强制动作经验，并且不放回采样
         replay_batch = replay_buffer.sample(
             batch_size=batch_size,
             include_forced_actions=False,
             replace=False,
         )
 
+        # 把 NumPy batch 转换成设备上的 Tensor batch
         batch = self._batch_to_tensors(replay_batch)
 
-        critic_info = self._update_critic(batch)
+        # 更新在线双 Critic
+        if not bool((batch.agent_indices == self.agent_index).all()):
+            raise ValueError("Routing batch contains another DC")
+        critic_info = self._update_critic(batch, next_value_provider)
 
+        # Critic 更新完成后，更新步数加 1
         self.update_step += 1
 
         nan_value = torch.full(
@@ -1158,21 +856,28 @@ class RoutingMASAC:
             device=self.device,
         )
 
+        # 先给 Actor 和 alpha 统计值设置默认值
+        # 当本次未到更新间隔时，这些值会保持 NaN
         actor_loss_value = nan_value
         alpha_loss_value = nan_value
         entropy_value = nan_value
         target_entropy_value = nan_value
 
+        # 到达策略更新间隔时，更新 Actor 和 alpha
         if self.update_step % int(self.config.policy_update_interval) == 0:
+            # 更新 Actor
             actor_info = self._update_actor(batch)
 
+            # 更新温度参数 alpha
             alpha_info = self._update_alpha(batch)
 
+            # 读取统计值
             actor_loss_value = actor_info["actor_loss"]
             entropy_value = actor_info["policy_entropy"]
             alpha_loss_value = alpha_info["alpha_loss"]
             target_entropy_value = alpha_info["target_entropy"]
 
+        # 到达目标网络更新间隔时，执行软更新
         if self.update_step % int(self.config.target_update_interval) == 0:
             soft_update(
                 target_network=self.target_critic,
@@ -1181,10 +886,6 @@ class RoutingMASAC:
             )
 
         update_info = {
-            "heuristic_reward_mean": critic_info["heuristic_reward_mean"],
-            "modified_reward_mean": critic_info["modified_reward_mean"],
-            "raw_reward_mean": critic_info["raw_reward_mean"],
-            "effective_gamma": critic_info["effective_gamma"],
             "update_step": float(self.update_step),
             "critic_loss": critic_info["critic_loss"],
             "q1_loss": critic_info["q1_loss"],
@@ -1201,18 +902,27 @@ class RoutingMASAC:
 
         return update_info
 
+    # 保存模型参数、优化器状态和更新步数
     def save(self, file_path: Union[str, Path]) -> None:
 
         file_path = Path(file_path)
 
+        # 自动创建父目录。
         file_path.parent.mkdir(
             parents=True,
             exist_ok=True,
         )
 
         checkpoint = {
-            "algorithm_role": "bcgh2_masac_routing_ctde_v1",
-            "environment_structure": getattr(self, "environment_structure", None),
+            # ======================================================
+            # Algorithm identity
+            #
+            # 防止以后把 Host SAC checkpoint
+            # 错误加载到 Routing MASAC。
+            # ======================================================
+            "algorithm_role": "mr_bcgh_local_routing_ctde",
+            "dc_id": self.dc_id,
+            "agent_index": self.agent_index,
             "local_obs_dim": self.local_obs_dim,
             "global_state_dim": self.global_state_dim,
             "action_dim": self.action_dim,
@@ -1233,21 +943,41 @@ class RoutingMASAC:
             file_path,
         )
 
+    # 从 checkpoint 恢复模型
     def load(self, file_path: Union[str, Path], load_optimizers: bool = True) -> None:
 
+        # 读取 checkpoint 并映射到当前设备。
         checkpoint = torch.load(
             Path(file_path),
             map_location=self.device,
             weights_only=False,
         )
 
-        # Preserve resume compatibility with checkpoints saved before the rename.
-        role = str(checkpoint.get("algorithm_role", "")).replace("_masca_", "_masac_")
+        # ==============================================================
+        # Routing checkpoint identity validation
+        #
+        # 禁止：
+        #   - Host checkpoint 错载进 Routing；
+        #   - 不同 Observation 结构；
+        #   - 不同 Routing action space；
+        #   - 不同 Agent 数量
+        #     的 checkpoint 被静默恢复。
+        # ==============================================================
 
-        if role != "bcgh2_masac_routing_ctde_v1":
-            raise RuntimeError(
-                "当前 checkpoint 不是 " "Routing MASAC + CTDE：" f"{role!r}"
-            )
+        role = checkpoint.get("algorithm_role")
+
+        if role != "mr_bcgh_local_routing_ctde":
+            raise RuntimeError("当前 checkpoint 不是 " "Routing MASAC + CTDE：" f"{role!r}")
+
+        if checkpoint.get("dc_id") != self.dc_id or checkpoint.get("agent_index") != self.agent_index:
+            raise RuntimeError("Routing checkpoint DC identity mismatch")
+        if checkpoint.get("config") != asdict(self.config):
+            raise RuntimeError("Routing checkpoint configuration mismatch")
+        if int(checkpoint.get("update_step", -1)) < 0:
+            raise RuntimeError("Invalid routing update counter")
+        saved_alpha = checkpoint.get("log_alpha")
+        if not torch.is_tensor(saved_alpha) or saved_alpha.numel() != 1 or not bool(torch.isfinite(saved_alpha).all()):
+            raise RuntimeError("Invalid routing temperature")
 
         dimension_checks = {
             "local_obs_dim": self.local_obs_dim,
@@ -1268,23 +998,16 @@ class RoutingMASAC:
                     f"current={current_value}"
                 )
 
-        saved_config = {
-            k: v for k, v in checkpoint.get("config", {}).items() if k != "device"
-        }
-        current_config = {k: v for k, v in asdict(self.config).items() if k != "device"}
-        if saved_config != current_config:
-            raise RuntimeError(
-                "Routing checkpoint training configuration differs; use explicit weight initialization"
-            )
-
-        if checkpoint.get("environment_structure") is not None:
-            self.environment_structure = checkpoint["environment_structure"]
+        # 加载 Actor 参数。
         self.actor.load_state_dict(checkpoint["actor_state_dict"])
 
+        # 加载在线 Critic 参数。
         self.critic.load_state_dict(checkpoint["critic_state_dict"])
 
+        # 加载目标 Critic 参数。
         self.target_critic.load_state_dict(checkpoint["target_critic_state_dict"])
 
+        # 恢复 log_alpha 数值。
         with torch.no_grad():
             self.log_alpha.copy_(
                 checkpoint["log_alpha"].to(
@@ -1293,36 +1016,14 @@ class RoutingMASAC:
                 )
             )
 
+        # 根据参数决定是否恢复优化器。
         if load_optimizers:
-            self.actor_optimizer.load_state_dict(
-                checkpoint["actor_optimizer_state_dict"]
-            )
-            self.critic_optimizer.load_state_dict(
-                checkpoint["critic_optimizer_state_dict"]
-            )
-            self.alpha_optimizer.load_state_dict(
-                checkpoint["alpha_optimizer_state_dict"]
-            )
+            self.actor_optimizer.load_state_dict(checkpoint["actor_optimizer_state_dict"])
+            self.critic_optimizer.load_state_dict(checkpoint["critic_optimizer_state_dict"])
+            self.alpha_optimizer.load_state_dict(checkpoint["alpha_optimizer_state_dict"])
 
+        # 恢复更新步数。
         self.update_step = int(checkpoint.get("update_step", 0))
-
-    def initialize_weights(self, file_path: Union[str, Path]) -> None:
-        """Explicit warm start: weights only; no old optimizers, alpha or replay."""
-        checkpoint = torch.load(
-            Path(file_path), map_location=self.device, weights_only=False
-        )
-        role = str(checkpoint.get("algorithm_role", "")).replace("_masca_", "_masac_")
-        if role not in {
-            "routing_masac_ctde",
-            "bcgh2_masac_routing_ctde_v1",
-        }:
-            raise ValueError("Expected compatible Routing weights")
-        for name in ("local_obs_dim", "global_state_dim", "action_dim", "num_agents"):
-            if checkpoint.get(name) != getattr(self, name):
-                raise ValueError(f"Routing weight shape mismatch: {name}")
-        self.actor.load_state_dict(checkpoint["actor_state_dict"])
-        self.critic.load_state_dict(checkpoint["critic_state_dict"])
-        self.target_critic.load_state_dict(checkpoint["target_critic_state_dict"])
 
     def train_mode(self) -> None:
         self.actor.train()
@@ -1334,17 +1035,22 @@ class RoutingMASAC:
         self.critic.eval()
         self.target_critic.eval()
 
+    # ==============================================================
+    # Common Device Resolver
+    #
+    # RoutingMASAC 和 LocalHostSAC 都需要设备选择，
+    # 但 Host SAC 不应该依赖 RoutingMASAC 类。
+    #
+    # 因此设备解析作为 module-level utility。
+    # ==============================================================
+
+    ##################### 辅助函数 ######################
+
+    # 把 ReplayBatch 中的 NumPy 数组转换成张量
     def _batch_to_tensors(
         self,
         batch: RoutingReplayBatch,
     ) -> RoutingTensorBatch:
-        # Validate on CPU before transfer to avoid synchronizing CUDA per update.
-        if not np.all(batch.heuristic_valid) or not np.all(
-            np.isfinite(batch.next_heuristic_scores)
-        ):
-            raise ValueError("Replay batch has missing or non-finite heuristic scores")
-        if np.any(batch.next_heuristic_scores[batch.done.astype(bool)] != 0):
-            raise ValueError("Terminal routing heuristic must be zero")
 
         agent_indices = torch.as_tensor(
             batch.agent_indices,
@@ -1361,6 +1067,11 @@ class RoutingMASAC:
             dtype=torch.float32,
             device=self.device,
         )
+        # action_masks = torch.as_tensor(
+        #     batch.action_masks,
+        #     dtype=torch.bool,
+        #     device=self.device,
+        # )
         actions = torch.as_tensor(
             batch.actions,
             dtype=torch.long,
@@ -1386,6 +1097,11 @@ class RoutingMASAC:
             dtype=torch.float32,
             device=self.device,
         )
+        # next_action_masks = torch.as_tensor(
+        #     batch.next_action_masks,
+        #     dtype=torch.bool,
+        #     device=self.device,
+        # )
         terminated = torch.as_tensor(
             batch.terminated,
             dtype=torch.float32,
@@ -1408,110 +1124,95 @@ class RoutingMASAC:
         )
 
         return RoutingTensorBatch(
-            next_heuristic_scores=torch.as_tensor(
-                batch.next_heuristic_scores, dtype=torch.float32, device=self.device
-            ),
-            heuristic_valid=torch.as_tensor(
-                batch.heuristic_valid, dtype=torch.bool, device=self.device
-            ),
             agent_indices=agent_indices,
             local_obs=local_obs,
             global_states=global_states,
+            # action_masks=action_masks,
             actions=actions,
             rewards=rewards,
             next_agent_indices=next_agent_indices,
             next_local_obs=next_local_obs,
             next_global_states=next_global_states,
+            # next_action_masks=next_action_masks,
             terminated=terminated,
             truncated=truncated,
             done=done,
             is_forced_action=is_forced_action,
         )
 
-    def _update_critic(self, batch: RoutingTensorBatch) -> Dict[str, float]:
+    # 更新在线双Q net
+    def _update_critic(self, batch: RoutingTensorBatch, next_value_provider) -> Dict[str, float]:
 
+        # 使用目标网络计算TD目标作为监督标签使用
         with torch.no_grad():
 
-            safe_next_agent_indices = torch.where(
-                batch.done.to(dtype=torch.bool),
-                torch.zeros_like(batch.next_agent_indices),
-                batch.next_agent_indices,
-            )
+            # The next same-job decision may belong to another DC.
+            # Only nonterminal rows access that DC's policy, target Q and alpha.
+            next_soft_value = next_value_provider(batch)
 
-            next_action_probs, (next_action_log_probs), _ = self.actor.get_policy(
-                local_obs=batch.next_local_obs,
-                agent_indices=(safe_next_agent_indices),
-            )
-
-            target_q1_all, target_q2_all = self.target_critic(
-                global_state=batch.next_global_states,
-                agent_indices=safe_next_agent_indices,
-            )
-
-            target_min_q_all = torch.minimum(
-                target_q1_all,
-                target_q2_all,
-            )
-
-            alpha = self.alpha.detach()
-
-            next_soft_value = (
-                next_action_probs * (target_min_q_all - alpha * next_action_log_probs)
-            ).sum(dim=-1)
-
+            # done=True 时不再 bootstrap。
             not_done = 1.0 - batch.done
 
-            target_q, heuristic_reward, modified_reward, effective_gamma = (
-                routing_td_target(
-                    batch.rewards,
-                    batch.next_heuristic_scores,
-                    batch.done,
-                    next_soft_value,
-                    self.config,
-                    batch.heuristic_valid,
-                    validate=False,
-                )
-            )
+            # 计算 TD 目标。
+            target_q = batch.rewards + float(self.config.gamma) * not_done * next_soft_value
 
+        # 使用在线双 Critic 计算当前全局状态的全部动作 Q 值。
         current_q1_all, current_q2_all = self.critic(
             global_state=batch.global_states,
             agent_indices=batch.agent_indices,
         )
 
+        # 从 Q1 的全部动作 Q 值中取出实际执行动作对应的值。
         current_q1 = current_q1_all.gather(
             dim=1,
             index=batch.actions.unsqueeze(1),
         ).squeeze(1)
 
+        # 从 Q2 中取出实际动作对应的值。
         current_q2 = current_q2_all.gather(
             dim=1,
             index=batch.actions.unsqueeze(1),
         ).squeeze(1)
 
+        # Q1 使用均方误差拟合 TD 目标。
         q1_loss = F.mse_loss(
             current_q1,
             target_q,
         )
 
+        # Q2 同样使用均方误差。
         q2_loss = F.mse_loss(
             current_q2,
             target_q,
         )
 
+        # 双 Critic 总损失是两个损失之和。
         critic_loss = q1_loss + q2_loss
 
+        # 清空上一次 Critic 反向传播留下的梯度。
         self.critic_optimizer.zero_grad(set_to_none=True)
 
+        # 反向传播计算 Critic 参数梯度。
         critic_loss.backward()
 
+        # 如果设置了梯度裁剪上限，则裁剪 Critic 梯度范数。
         if self.config.max_grad_norm is not None:
             nn.utils.clip_grad_norm_(
                 self.critic.parameters(),
                 max_norm=float(self.config.max_grad_norm),
             )
 
+        # 根据梯度更新在线双 Critic 参数。
         self.critic_optimizer.step()
 
+        # return {
+        #     "critic_loss": float(critic_loss.detach().item()),
+        #     "q1_loss": float(q1_loss.detach().item()),
+        #     "q2_loss": float(q2_loss.detach().item()),
+        #     "mean_q1": float(current_q1.detach().mean().item()),
+        #     "mean_q2": float(current_q2.detach().mean().item()),
+        #     "mean_target_q": float(target_q.detach().mean().item()),
+        # }
         return {
             "critic_loss": critic_loss.detach(),
             "q1_loss": q1_loss.detach(),
@@ -1519,71 +1220,88 @@ class RoutingMASAC:
             "mean_q1": (current_q1.detach().mean()),
             "mean_q2": (current_q2.detach().mean()),
             "mean_target_q": (target_q.detach().mean()),
-            "heuristic_reward_mean": heuristic_reward.detach().mean(),
-            "modified_reward_mean": modified_reward.detach().mean(),
-            "raw_reward_mean": batch.rewards.detach().mean(),
-            "effective_gamma": target_q.new_tensor(effective_gamma),
         }
 
+    # 更新actor
     def _update_actor(
         self,
         batch: RoutingTensorBatch,
     ) -> Dict[str, float]:
 
+        # 计算当前局部观测下所有普通动作的概率和 log 概率。
         action_probs, action_log_probs, _ = self.actor.get_policy(
             local_obs=batch.local_obs,
             agent_indices=batch.agent_indices,
         )
 
+        # Actor 更新不需要修改 Critic 参数
+        # Q 值只作为评价当前策略动作好坏的固定信号
         with torch.no_grad():
             q1_all, q2_all = self.critic(
                 global_state=batch.global_states,
                 agent_indices=batch.agent_indices,
             )
 
+            # 对每个动作使用较小的 Q 值
             min_q_all = torch.minimum(
                 q1_all,
                 q2_all,
             )
 
+        # Actor 更新中 alpha 也作为常数使用
         alpha = self.alpha.detach()
 
-        actor_loss_per_sample = (
-            action_probs * (alpha * action_log_probs - min_q_all)
-        ).sum(dim=-1)
+        # 离散 SAC Actor 损失：
+        # sum_a pi(a|o) * [alpha*log pi(a|o) - min(Q1,Q2)]
+        actor_loss_per_sample = (action_probs * (alpha * action_log_probs - min_q_all)).sum(dim=-1)
 
+        # 对 batch 求平均。
         actor_loss = actor_loss_per_sample.mean()
 
+        # 清空 Actor 旧梯度。
         self.actor_optimizer.zero_grad(set_to_none=True)
 
+        # 反向传播计算 Actor 梯度。
         actor_loss.backward()
 
+        # 如果启用梯度裁剪，则裁剪 Actor 梯度。
         if self.config.max_grad_norm is not None:
             nn.utils.clip_grad_norm_(
                 self.actor.parameters(),
                 max_norm=float(self.config.max_grad_norm),
             )
 
+        # 更新 Actor 参数。
         self.actor_optimizer.step()
 
+        # 计算当前策略熵：-sum_a pi log pi。
         policy_entropy = -(action_probs * action_log_probs).sum(dim=-1)
 
+        # return {
+        #     "actor_loss": float(actor_loss.detach().item()),
+        #     "policy_entropy": float(
+        #         policy_entropy.detach().mean().item()
+        #     ),
+        # }
         return {
             "actor_loss": (actor_loss.detach()),
             "policy_entropy": (policy_entropy.detach().mean()),
         }
 
+    # 更新温度系数alpha
     def _update_alpha(
         self,
         batch: RoutingTensorBatch,
     ) -> Dict[str, float]:
 
+        # alpha 更新时不需要更新 Actor，因此不记录 Actor 计算图。
         with torch.no_grad():
             action_probs, (action_log_probs), _ = self.actor.get_policy(
                 local_obs=batch.local_obs,
                 agent_indices=(batch.agent_indices),
             )
 
+            # 计算每条样本当前策略熵。
             policy_entropy = -(action_probs * action_log_probs).sum(dim=-1)
 
             target_entropy_value = float(self.config.target_entropy_ratio) * math.log(
@@ -1595,26 +1313,226 @@ class RoutingMASAC:
                 fill_value=(target_entropy_value),
             )
 
-        alpha_loss = (
-            self.log_alpha * (policy_entropy.detach() - target_entropy.detach())
-        ).mean()
+            # 统计每条样本的合法动作数量。
+            # valid_action_count = batch.action_masks.sum(
+            #     dim=-1
+            # ).to(dtype=torch.float32)
 
+            # 合法动作数量至少为 1。
+            # valid_action_count = valid_action_count.clamp_min(
+            #     1.0
+            # )
+
+            # 目标熵随合法动作数量变化。
+            # target_entropy = (
+            #         float(self.config.target_entropy_ratio)
+            #         * torch.log(valid_action_count)
+            # )
+
+        # alpha 损失：
+        # 当实际熵低于目标熵时，梯度下降会增大 log_alpha；
+        # 当实际熵高于目标熵时，梯度下降会减小 log_alpha。
+        alpha_loss = (self.log_alpha * (policy_entropy.detach() - target_entropy.detach())).mean()
+
+        # 清空 alpha 优化器旧梯度。
         self.alpha_optimizer.zero_grad(set_to_none=True)
 
+        # 对 log_alpha 反向传播。
         alpha_loss.backward()
 
+        # 更新 log_alpha。
         self.alpha_optimizer.step()
 
+        # 防止极端情况下 alpha 数值爆炸或趋近完全为 0。
+        # 这里限制的是 log_alpha，因此 alpha 大约位于 [exp(-20), exp(5)]。
         with torch.no_grad():
             self.log_alpha.clamp_(
                 min=-20.0,
                 max=5.0,
             )
 
+        # 返回日志值。
+        # return {
+        #     "alpha_loss": float(alpha_loss.detach().item()),
+        #     "target_entropy": float(
+        #         target_entropy.detach().mean().item()
+        #     ),
+        # }
         return {
             "alpha_loss": (alpha_loss.detach()),
             "target_entropy": (target_entropy.detach().mean()),
         }
+
+
+class RoutingMASAC:
+    """Independent routing learners with a parameter-free CTDE coordinator."""
+
+    def __init__(self, local_obs_dim, global_state_dim, action_dim, num_agents,
+                 edge_dc_ids, action_target_dc_ids, config=None):
+        self.edge_dc_ids = tuple(map(str, edge_dc_ids))
+        self.action_target_dc_ids = tuple(map(str, action_target_dc_ids))
+        self.num_agents = int(num_agents)
+        self.local_obs_dim = int(local_obs_dim)
+        self.global_state_dim = int(global_state_dim)
+        self.action_dim = int(action_dim)
+        self.config = config or RoutingMASACConfig()
+        if len(self.edge_dc_ids) != self.num_agents or len(set(self.edge_dc_ids)) != self.num_agents:
+            raise ValueError("Routing DC identity/order is invalid")
+        if self.num_agents < 1 or min(self.local_obs_dim, self.global_state_dim, self.action_dim) < 1:
+            raise ValueError("Routing dimensions must be positive")
+        if len(self.action_target_dc_ids) != self.action_dim:
+            raise ValueError("Routing action target count does not match action dimension")
+        self.dc_to_index = {dc: i for i, dc in enumerate(self.edge_dc_ids)}
+        self.agents = {}
+        for i, dc in enumerate(self.edge_dc_ids):
+            seed = None if self.config.seed is None else int(self.config.seed) + 10_000 + i
+            self.agents[dc] = LocalRoutingMASAC(
+                self.local_obs_dim, self.global_state_dim, self.action_dim, self.num_agents,
+                dc_id=dc, agent_index=i, config=replace(self.config, seed=seed),
+            )
+        self.device = self.agents[self.edge_dc_ids[0]].device
+        self.action_steps = {dc: 0 for dc in self.edge_dc_ids}
+        self.last_train_action_steps = {dc: 0 for dc in self.edge_dc_ids}
+
+    def agent_for_index(self, agent_index):
+        index = int(agent_index)
+        if not 0 <= index < self.num_agents:
+            raise ValueError(f"Unknown routing agent index: {index}")
+        return self.agents[self.edge_dc_ids[index]]
+
+    def get_logits(self, local_obs, agent_index):
+        return self.agent_for_index(agent_index).actor(local_obs)
+
+    def select_action(self, local_obs, agent_index, deterministic=False):
+        return self.agent_for_index(agent_index).select_action(local_obs, agent_index, deterministic)
+
+    @torch.no_grad()
+    def next_soft_values(self, batch):
+        """Group nonterminal successors by DC; never evaluate terminal sentinels."""
+        values = torch.zeros_like(batch.rewards)
+        nonterminal = ~batch.done.bool()
+        indices = batch.next_agent_indices[nonterminal]
+        if bool(((indices < 0) | (indices >= self.num_agents)).any()):
+            raise ValueError("Nonterminal routing transition has an invalid successor DC")
+        for index in torch.unique(indices).tolist():
+            rows = nonterminal & (batch.next_agent_indices == index)
+            successor = self.agent_for_index(index)
+            probs, log_probs, _ = successor.actor.get_policy(batch.next_local_obs[rows])
+            q1, q2 = successor.target_critic(batch.next_global_states[rows])
+            values[rows] = (probs * (torch.minimum(q1, q2) - successor.alpha.detach() * log_probs)).sum(-1)
+        return values
+
+    def record_action(self, dc_id):
+        self.action_steps[str(dc_id)] += 1
+
+    def update_ready(self, replay_buffers, train_config):
+        """One update block per elapsed local interval, including delayed replay arrivals."""
+        if tuple(replay_buffers.edge_dc_ids) != self.edge_dc_ids:
+            raise ValueError("Routing replay DC order mismatch")
+        interval = int(train_config.routing_train_every)
+        if interval < 1 or int(train_config.routing_updates_per_train) < 1:
+            raise ValueError("Routing update intervals must be positive")
+        results = []
+        for dc in self.edge_dc_ids:
+            steps = self.action_steps[dc]
+            replay = replay_buffers.buffers[dc]
+            if (steps < int(train_config.routing_learning_starts)
+                    or steps // interval <= self.last_train_action_steps[dc] // interval
+                    or not replay.can_sample(int(train_config.routing_batch_size))):
+                continue
+            infos = [self.agents[dc].update(
+                replay, int(train_config.routing_batch_size), self.next_soft_values
+            ) for _ in range(int(train_config.routing_updates_per_train))]
+            self.last_train_action_steps[dc] = steps
+            results.append((dc, infos))
+        return results
+
+    @property
+    def update_step(self):
+        """System diagnostic: sum of the independent DC update counters."""
+        return sum(agent.update_step for agent in self.agents.values())
+
+    @property
+    def alpha(self):
+        """System diagnostic only: unweighted mean over DC temperatures."""
+        return torch.stack([agent.alpha.detach() for agent in self.agents.values()]).mean()
+
+    def train_mode(self):
+        for agent in self.agents.values():
+            agent.train_mode()
+
+    def eval_mode(self):
+        for agent in self.agents.values():
+            agent.eval_mode()
+
+    def structure_metadata(self):
+        return {
+            "parameter_sharing": False,
+            "edge_dc_ids": list(self.edge_dc_ids),
+            "action_target_dc_ids": list(self.action_target_dc_ids),
+            "local_obs_dim": self.local_obs_dim,
+            "global_state_dim": self.global_state_dim,
+            "action_dim": self.action_dim,
+            "num_agents": self.num_agents,
+            "actor_hidden_dim": self.config.actor_hidden_dim,
+            "critic_hidden_dim": self.config.critic_hidden_dim,
+        }
+
+    def trainer_counters(self):
+        return {"action_steps": dict(self.action_steps),
+                "last_train_action_steps": dict(self.last_train_action_steps),
+                "update_steps": {dc: agent.update_step for dc, agent in self.agents.items()}}
+
+    def save(self, file_path):
+        file_path = Path(file_path)
+        routing_dir = file_path.with_name(file_path.stem + "_routing")
+        files = {}
+        for index, dc in enumerate(self.edge_dc_ids):
+            name = f"dc_{index}.pt"
+            self.agents[dc].save(routing_dir / name)
+            files[dc] = name
+        _atomic_torch_save({
+            "algorithm_role": "mr_bcgh_independent_routing_ctde_v1",
+            "structure": self.structure_metadata(),
+            "config": asdict(self.config),
+            "files": files,
+            "trainer_counters": self.trainer_counters(),
+        }, file_path)
+
+    def load(self, file_path, load_optimizers=True):
+        """Validate and load every DC into temporary learners before committing."""
+        file_path = Path(file_path)
+        manifest = torch.load(file_path, map_location=self.device, weights_only=False)
+        if manifest.get("algorithm_role") != "mr_bcgh_independent_routing_ctde_v1":
+            raise RuntimeError("Checkpoint is not MR-BCGH-MASAC independent routing")
+        if manifest.get("structure") != self.structure_metadata():
+            raise RuntimeError("MR routing checkpoint structure/order mismatch")
+        if manifest.get("config") != asdict(self.config):
+            raise RuntimeError("MR routing checkpoint configuration mismatch")
+        expected_files = {dc: f"dc_{i}.pt" for i, dc in enumerate(self.edge_dc_ids)}
+        if manifest.get("files") != expected_files:
+            raise RuntimeError("MR routing checkpoint must contain every DC")
+        counters = manifest.get("trainer_counters", {})
+        for name in ("action_steps", "last_train_action_steps", "update_steps"):
+            saved = counters.get(name)
+            if not isinstance(saved, dict) or set(saved) != set(self.edge_dc_ids):
+                raise RuntimeError(f"Incomplete MR routing counters: {name}")
+            if any(type(v) is not int or v < 0 for v in saved.values()):
+                raise RuntimeError(f"Invalid MR routing counters: {name}")
+        if any(counters["last_train_action_steps"][dc] > counters["action_steps"][dc]
+               for dc in self.edge_dc_ids):
+            raise RuntimeError("MR routing update schedule exceeds action counters")
+        routing_dir = file_path.with_name(file_path.stem + "_routing")
+        staged = {}
+        for dc in self.edge_dc_ids:
+            agent = copy.deepcopy(self.agents[dc])
+            agent.load(routing_dir / expected_files[dc], load_optimizers=load_optimizers)
+            if agent.update_step != counters["update_steps"][dc]:
+                raise RuntimeError(f"MR routing update counter mismatch: {dc}")
+            staged[dc] = agent
+        self.agents = staged
+        self.action_steps = dict(counters["action_steps"])
+        self.last_train_action_steps = dict(counters["last_train_action_steps"])
 
 
 class LocalHostSAC:
@@ -1995,9 +1913,7 @@ class LocalHostSAC:
                 ),
             )
 
-        alpha_loss = (
-            self.log_alpha * (policy_entropy.detach() - target_entropy.detach())
-        ).mean()
+        alpha_loss = (self.log_alpha * (policy_entropy.detach() - target_entropy.detach())).mean()
 
         self.alpha_optimizer.zero_grad(set_to_none=True)
 
@@ -2087,6 +2003,13 @@ class LocalHostSAC:
         if role != "local_host_sac":
             raise RuntimeError("当前 checkpoint " "不是 Local Host SAC：" f"{role!r}")
 
+        # ==============================================================
+        # Host checkpoint dimension validation
+        #
+        # 每个 DC 的 Host 数可能不同，
+        # 因此 action_dim 必须逐 DC 严格一致。
+        # ==============================================================
+
         dimension_checks = {
             "obs_dim": self.obs_dim,
             "action_dim": self.action_dim,
@@ -2119,17 +2042,11 @@ class LocalHostSAC:
             )
 
         if load_optimizers:
-            self.actor_optimizer.load_state_dict(
-                checkpoint["actor_optimizer_state_dict"]
-            )
+            self.actor_optimizer.load_state_dict(checkpoint["actor_optimizer_state_dict"])
 
-            self.critic_optimizer.load_state_dict(
-                checkpoint["critic_optimizer_state_dict"]
-            )
+            self.critic_optimizer.load_state_dict(checkpoint["critic_optimizer_state_dict"])
 
-            self.alpha_optimizer.load_state_dict(
-                checkpoint["alpha_optimizer_state_dict"]
-            )
+            self.alpha_optimizer.load_state_dict(checkpoint["alpha_optimizer_state_dict"])
 
         self.update_step = int(
             checkpoint.get(
@@ -2143,9 +2060,7 @@ class LocalHostSAC:
 def resolve_training_device(
     configured_device: Optional[str],
 ) -> torch.device:
-    device = torch.device(
-        "cuda:0" if configured_device is None else str(configured_device)
-    )
+    device = torch.device("cuda:0" if configured_device is None else str(configured_device))
     if device.type != "cuda":
         raise ValueError(f"当前项目要求只使用 GPU 训练，但配置的设备是：{device}")
     if not torch.cuda.is_available():
@@ -2156,11 +2071,10 @@ def resolve_training_device(
     gpu_index = torch.cuda.current_device() if device.index is None else device.index
     gpu_count = torch.cuda.device_count()
     if gpu_index >= gpu_count:
-        raise RuntimeError(
-            f"指定了 GPU 编号 {gpu_index}，但 PyTorch 只检测到 {gpu_count} 张 GPU。"
-        )
+        raise RuntimeError(f"指定了 GPU 编号 {gpu_index}，但 PyTorch 只检测到 {gpu_count} 张 GPU。")
     device = torch.device("cuda", gpu_index)
     try:
+        # Use constants so the preflight leaves training random streams untouched.
         with torch.inference_mode(False), torch.enable_grad():
             x = torch.ones((8, 8), device=device, requires_grad=True)
             weights = torch.full((8, 8), 0.125).to(device)

@@ -1,1952 +1,6 @@
-"""BCGH2-MASAC Bayesian runtime, state scoring and training support."""
+"""Training rewards, collection, statistics, logging, and checkpoints."""
 
 from __future__ import annotations
-
-"""Bayesian routing definition and terminal evidence."""
-
-import math
-from dataclasses import dataclass
-from enum import Enum
-from typing import Any, Dict, Optional, Tuple
-
-from .experience import FinalizedJobTrace
-
-
-@dataclass(frozen=True)
-class BayesianInformationPolicy:
-    """
-    Bayesian Game 的固定信息访问策略。
-
-    注意：
-        这不是可训练参数，也不应该放入 config.py。
-
-    它用于明确保证：
-
-        Remote Real-Time State
-            X
-            |
-        Bayesian Belief
-    """
-
-    allow_static_routing_topology: bool = True
-
-    allow_finalized_historical_outcomes: bool = True
-
-    allow_neighbor_historical_feedback: bool = True
-
-    allow_current_job_context: bool = True
-
-    allow_source_local_information: bool = True
-    allow_static_installed_capacity: bool = True
-    allow_local_queue_previous_hop: bool = True
-
-    allow_remote_realtime_cpu: bool = False
-
-    allow_remote_realtime_gpu: bool = False
-
-    allow_remote_realtime_queue: bool = False
-
-    allow_remote_realtime_host_state: bool = False
-
-    allow_remote_available_resources: bool = False
-
-    allow_remote_raw_observation: bool = False
-
-    allow_raw_environment_reference: bool = False
-
-    def validate(self) -> None:
-        """
-        Fail-fast 验证 Bayesian Information Boundary。
-
-        任何 Remote Real-Time 信息一旦被允许，
-        都意味着当前算法已经破坏 Remote Edge
-        Partial Observability 的研究假设。
-        """
-
-        forbidden_flags = {
-            "allow_remote_realtime_cpu": self.allow_remote_realtime_cpu,
-            "allow_remote_realtime_gpu": self.allow_remote_realtime_gpu,
-            "allow_remote_realtime_queue": self.allow_remote_realtime_queue,
-            "allow_remote_realtime_host_state": self.allow_remote_realtime_host_state,
-            "allow_remote_available_resources": self.allow_remote_available_resources,
-            "allow_remote_raw_observation": self.allow_remote_raw_observation,
-            "allow_raw_environment_reference": self.allow_raw_environment_reference,
-        }
-
-        enabled_forbidden_flags = [
-            flag_name for flag_name, enabled in forbidden_flags.items() if bool(enabled)
-        ]
-
-        if enabled_forbidden_flags:
-            raise RuntimeError(
-                "Bayesian Information Boundary 被破坏："
-                "禁止 Bayesian Game 使用 Remote "
-                "Real-Time State。"
-                f" enabled={enabled_forbidden_flags}"
-            )
-
-    def to_metadata(
-        self,
-    ) -> Dict[str, bool]:
-        """
-        返回实验可记录的信息边界 metadata。
-        """
-
-        return {
-            "allow_static_installed_capacity": self.allow_static_installed_capacity,
-            "allow_local_queue_previous_hop": self.allow_local_queue_previous_hop,
-            "allow_static_routing_topology": bool(self.allow_static_routing_topology),
-            "allow_finalized_historical_outcomes": bool(
-                self.allow_finalized_historical_outcomes
-            ),
-            "allow_neighbor_historical_feedback": bool(
-                self.allow_neighbor_historical_feedback
-            ),
-            "allow_current_job_context": bool(self.allow_current_job_context),
-            "allow_source_local_information": bool(self.allow_source_local_information),
-            "allow_remote_realtime_cpu": bool(self.allow_remote_realtime_cpu),
-            "allow_remote_realtime_gpu": bool(self.allow_remote_realtime_gpu),
-            "allow_remote_realtime_queue": bool(self.allow_remote_realtime_queue),
-            "allow_remote_realtime_host_state": bool(
-                self.allow_remote_realtime_host_state
-            ),
-            "allow_remote_available_resources": bool(
-                self.allow_remote_available_resources
-            ),
-            "allow_remote_raw_observation": bool(self.allow_remote_raw_observation),
-            "allow_raw_environment_reference": bool(
-                self.allow_raw_environment_reference
-            ),
-        }
-
-
-def congestion_observed_from_outcome(
-    *,
-    success: bool,
-    sla_satisfied: bool,
-    reforwarded: bool,
-) -> bool:
-    """将终止任务的历史结果统一映射为拥塞 Bernoulli 样本。
-
-    第 2 步的唯一观测语义是：
-
-    * ``True``  ：观测到拥塞证据，更新 ``alpha_congested``；
-    * ``False`` ：观测到非拥塞证据，更新 ``beta_non_congested``。
-
-    失败或 SLA 违约视为终局风险。再转发由独立的四分类吸收信念
-    建模，不能在此重复计入拥塞风险。
-    """
-
-    del reforwarded
-    return bool((not success) or (not sla_satisfied))
-
-
-@dataclass(frozen=True)
-class BayesianHistoricalEvidence:
-    """
-    Bayesian Evidence。
-
-    表示：
-
-        source DC
-            |
-            |
-            v
-        target DC
-
-    历史调度结果对于 Remote Service Suitability
-    的一次观测证据。
-
-    注意：
-
-    Evidence 不是 Remote State。
-
-    禁止包含：
-
-        CPU
-        GPU
-        Queue
-        Host state
-        utilization
-        resource availability
-        raw observation
-
-    只允许包含：
-
-        历史动作结果
-        SLA outcome
-        completion outcome
-        latency outcome
-        energy outcome
-    """
-
-    source_dc_id: str
-
-    target_dc_id: str
-
-    outcome_type: str
-
-    success: bool
-
-    sla_satisfied: bool
-
-    reforwarded: bool = False
-
-    evidence_weight: float = 1.0
-
-    normalized_latency_score: float = 0.0
-
-    normalized_energy_score: float = 0.0
-
-    completion_time_s: Optional[float] = None
-
-    timestamp: Optional[float] = None
-    routing_time: Optional[float] = None
-    evidence_id: Optional[str] = None
-
-    @property
-    def congestion_observed(self) -> bool:
-        """返回本条 Evidence 是否属于拥塞侧 Bernoulli 样本。"""
-
-        return congestion_observed_from_outcome(
-            success=self.success,
-            sla_satisfied=self.sla_satisfied,
-            reforwarded=self.reforwarded,
-        )
-
-    def validate_information_boundary(
-        self,
-    ) -> None:
-        """
-        防止 Evidence 演化成 Remote State。
-
-        当前 Evidence 必须满足：
-
-            Historical Outcome only
-
-        """
-
-        forbidden_fields = [
-            "cpu",
-            "gpu",
-            "queue",
-            "host_state",
-            "available_resource",
-            "raw_observation",
-        ]
-
-        for field_name in forbidden_fields:
-
-            if hasattr(
-                self,
-                field_name,
-            ):
-
-                raise RuntimeError(
-                    "Bayesian Evidence "
-                    "禁止包含 Remote Real-Time State:"
-                    f"{field_name}"
-                )
-
-        if not self.source_dc_id or not self.target_dc_id:
-            raise ValueError(
-                "Bayesian Evidence 的 source_dc_id / target_dc_id 不能为空。"
-            )
-
-        if self.source_dc_id == self.target_dc_id:
-            raise ValueError(
-                "Bayesian Evidence 必须表示有向 source -> target DC 对，不能是自环。"
-            )
-
-        if self.outcome_type not in {
-            BayesianHiddenState.GOOD.value,
-            BayesianHiddenState.NORMAL.value,
-            BayesianHiddenState.RISKY.value,
-        }:
-            raise ValueError(
-                "outcome_type 必须是 GOOD、NORMAL 或 RISKY；该标签仅用于诊断。"
-            )
-
-        if not math.isfinite(self.evidence_weight) or self.evidence_weight <= 0.0:
-            raise ValueError("evidence_weight 必须大于 0。")
-
-        for score_name, score in (
-            ("normalized_latency_score", self.normalized_latency_score),
-            ("normalized_energy_score", self.normalized_energy_score),
-        ):
-            if not math.isfinite(score) or not 0.0 <= score <= 1.0:
-                raise ValueError(f"{score_name} 必须位于 [0, 1]。")
-
-
-def classify_historical_outcome(
-    *,
-    success: bool,
-    sla_satisfied: bool,
-    normalized_latency_score: float,
-    reforwarded: bool = False,
-) -> str:
-    """
-    根据历史结果生成 Remote Hidden Type 的诊断标签。
-
-    注意：
-
-    这里不是 Bayesian posterior。
-
-    只是：
-
-        outcome
-          |
-          v
-        evidence label
-
-    注意：GOOD/NORMAL/RISKY 不是 ``alpha`` / ``beta`` 的直接值，
-    也不是 posterior。拥塞 posterior 统一由
-    ``congestion_observed_from_outcome`` 生成 Bernoulli 样本。
-    """
-
-    if success and sla_satisfied and normalized_latency_score >= 0.8:
-        return BayesianHiddenState.GOOD.value
-
-    if success and sla_satisfied:
-        return BayesianHiddenState.NORMAL.value
-
-    return BayesianHiddenState.RISKY.value
-
-
-class BayesianHiddenState(str, Enum):
-    """
-    Remote Service Hidden State θ
-
-    表示:
-
-        source DC
-            |
-            |
-            v
-
-        target DC
-
-    在长期运行过程中的服务可靠性状态。
-
-    """
-
-    GOOD = "good"
-
-    NORMAL = "normal"
-
-    RISKY = "risky"
-
-
-class BayesianRoutingActionKind(str, Enum):
-    """
-    Routing Actor 动作在 Bayesian Game 中的语义类型。
-    """
-
-    SELF = "self"
-
-    REMOTE_EDGE = "remote_edge"
-
-    CLOUD = "cloud"
-
-
-@dataclass(frozen=True)
-class BayesianRoutingActionSemantic:
-    """
-    从某个 source DC 的视角描述一条 Routing action。
-
-    只有 REMOTE_EDGE action 才对应未知 Remote Type。
-    """
-
-    action_index: int
-
-    target_dc_id: str
-
-    action_kind: BayesianRoutingActionKind
-
-    has_hidden_remote_type: bool
-
-
-@dataclass(frozen=True)
-class BayesianStaticRoutingContext:
-    """
-    Bayesian Game 从 Environment 中允许获得的
-    唯一静态 Routing Context。
-
-    该对象刻意只保存 Routing identity / topology。
-
-    因此这里明确不存在：
-
-        CPU
-        GPU
-        Queue
-        Host
-        available resources
-        utilization
-        local observation
-        global state
-
-    完整 Environment 只允许在 whitelist adapter 中出现。
-    Bayesian Game Core 后续只能接收本 Context。
-    """
-
-    edge_dc_ids: Tuple[str, ...]
-
-    routing_action_target_dc_ids: Tuple[str, ...]
-
-    cloud_enabled: bool
-
-    cloud_id: Optional[str]
-
-
-def build_bayesian_static_routing_context(
-    env: Any,
-) -> BayesianStaticRoutingContext:
-    """
-    从完整 Environment 中提取 Bayesian Game
-    唯一允许使用的静态 Routing 信息。
-
-    这是 Bayesian 子系统与完整 Environment 之间
-    唯一允许存在的 direct adapter。
-
-    白名单只允许读取：
-
-        edge_dc_ids
-        routing_action_target_dc_ids
-        enable_cloud_action
-        cloud_id
-
-    明确禁止未来在本函数中加入：
-
-        datacenters
-        host_list
-        CPU / GPU utilization
-        waiting queue
-        running queue
-        available resources
-        Remote observation
-        Remote load
-
-    如果以后 Bayesian 模块需要新的输入，
-    必须先判断它是否违反 Remote Partial Observability。
-    """
-
-    edge_dc_ids = tuple(str(dc_id) for dc_id in env.edge_dc_ids)
-
-    routing_action_target_dc_ids = tuple(
-        str(dc_id) for dc_id in env.routing_action_target_dc_ids
-    )
-
-    cloud_enabled = bool(
-        getattr(
-            env,
-            "enable_cloud_action",
-            False,
-        )
-    )
-
-    raw_cloud_id = getattr(
-        env,
-        "cloud_id",
-        None,
-    )
-
-    cloud_id = (
-        str(raw_cloud_id) if (cloud_enabled and raw_cloud_id is not None) else None
-    )
-
-    return BayesianStaticRoutingContext(
-        edge_dc_ids=(edge_dc_ids),
-        routing_action_target_dc_ids=(routing_action_target_dc_ids),
-        cloud_enabled=(cloud_enabled),
-        cloud_id=(cloud_id),
-    )
-
-
-@dataclass(frozen=True)
-class BayesianRoutingGameDefinition:
-    """
-    BCGH2-MASAC Bayesian Routing Game 的静态定义。
-
-    这是 Game Schema，不是 Bayesian State。
-
-    因此：
-        - 不维护 alpha / posterior；
-        - 不读取 Neighbor Feedback；
-        - 不访问 Remote realtime state；
-        - 不改变 Routing Observation；
-        - 不改变 MASAC policy；
-        - 不改变 Reward。
-    """
-
-    player_ids: Tuple[str, ...]
-
-    action_target_dc_ids: Tuple[str, ...]
-
-    cloud_enabled: bool
-
-    cloud_id: Optional[str]
-
-    remote_type_space: Tuple[BayesianHiddenState, ...]
-
-    information_policy: BayesianInformationPolicy
-
-    decision_layer: str = "routing_only"
-
-    decision_process: str = "asynchronous_repeated_routing"
-
-    game_objective: str = "cooperative_system_scheduling"
-
-    belief_scope: str = "directed_source_target_pair"
-
-    evidence_scope: str = (
-        "short_window_outcomes_and_local_queue_previous_hop_soft_evidence"
-    )
-
-    utility_semantics: str = "cooperative_expected_routing_prior_utility"
-
-    equilibrium_solver: str = "none"
-
-    externality_extension: str = "short_window_cpu_gpu_marginal_competition"
-
-    def directed_remote_pairs(
-        self,
-    ) -> Tuple[Tuple[str, str], ...]:
-        """
-        返回未来 Bayesian Belief Store 允许维护的全部：
-
-            source Edge -> target Edge
-
-        有向 pair。
-
-        Self 和 Cloud 均不建立 Remote Type Belief。
-        """
-
-        return tuple(
-            (
-                source_dc_id,
-                target_dc_id,
-            )
-            for source_dc_id in self.player_ids
-            for target_dc_id in self.player_ids
-            if target_dc_id != source_dc_id
-        )
-
-    def action_semantics_for(
-        self,
-        source_dc_id: str,
-    ) -> Tuple[BayesianRoutingActionSemantic, ...]:
-        """
-        返回一个 Routing Agent 对全部 action 的 Bayesian 语义。
-
-        规则：
-
-            source -> source
-                Self
-
-            source -> another Edge
-                Remote Edge
-                存在 Hidden Type
-
-            source -> Cloud
-                Cloud
-                不建立 Remote Edge Type
-        """
-
-        source_dc_id = str(source_dc_id)
-
-        if source_dc_id not in self.player_ids:
-            raise ValueError(
-                "Bayesian Routing Game 中不存在 player：" f"{source_dc_id}"
-            )
-
-        action_semantics = []
-
-        for action_index, target_dc_id in enumerate(self.action_target_dc_ids):
-
-            target_dc_id = str(target_dc_id)
-
-            if target_dc_id == source_dc_id:
-
-                action_kind = BayesianRoutingActionKind.SELF
-
-            elif target_dc_id in self.player_ids:
-
-                action_kind = BayesianRoutingActionKind.REMOTE_EDGE
-
-            elif (
-                self.cloud_enabled
-                and self.cloud_id is not None
-                and target_dc_id == self.cloud_id
-            ):
-
-                action_kind = BayesianRoutingActionKind.CLOUD
-
-            else:
-
-                raise RuntimeError(
-                    "发现未知 Routing target："
-                    f"source={source_dc_id}, "
-                    f"target={target_dc_id}, "
-                    f"action={action_index}"
-                )
-
-            action_semantics.append(
-                BayesianRoutingActionSemantic(
-                    action_index=int(action_index),
-                    target_dc_id=(target_dc_id),
-                    action_kind=(action_kind),
-                    has_hidden_remote_type=(
-                        action_kind == BayesianRoutingActionKind.REMOTE_EDGE
-                    ),
-                )
-            )
-
-        return tuple(action_semantics)
-
-    def to_metadata(
-        self,
-    ) -> Dict[str, Any]:
-        """
-        返回可日志化的静态 Game Definition。
-
-        注意：
-            这里不包含任何 Bayesian Posterior。
-        """
-
-        return {
-            "player_ids": list(self.player_ids),
-            "action_target_dc_ids": list(self.action_target_dc_ids),
-            "cloud_enabled": bool(self.cloud_enabled),
-            "cloud_id": self.cloud_id,
-            "remote_type_space": [
-                remote_type.value for remote_type in self.remote_type_space
-            ],
-            "decision_layer": self.decision_layer,
-            "decision_process": self.decision_process,
-            "game_objective": self.game_objective,
-            "belief_scope": self.belief_scope,
-            "evidence_scope": self.evidence_scope,
-            "utility_semantics": self.utility_semantics,
-            "equilibrium_solver": self.equilibrium_solver,
-            "information_policy": self.information_policy.to_metadata(),
-            "externality_extension": self.externality_extension,
-            "directed_remote_pair_count": len(self.directed_remote_pairs()),
-        }
-
-
-def build_bayesian_routing_game_definition(
-    static_context: BayesianStaticRoutingContext,
-) -> BayesianRoutingGameDefinition:
-    """
-    根据已经脱敏的 BayesianStaticRoutingContext
-    构造 Bayesian Routing Game Definition。
-
-    重要：
-
-        本函数从 Step 5 开始不再接收完整 Environment。
-
-    因此本函数在接口层面无法读取：
-
-        Remote CPU
-        Remote GPU
-        Remote Queue
-        Remote Host
-        Remote available resources
-        Remote raw observation
-
-    本函数只处理：
-
-        Edge DC identity
-        Routing action target mapping
-        Cloud ON/OFF
-        Cloud ID
-
-    它：
-
-        不调用随机数；
-        不维护 Bayesian posterior；
-        不读取 Historical Feedback；
-        不修改 Observation；
-        不修改 Reward；
-        不修改 Replay；
-        不修改 Actor / Critic。
-    """
-
-    information_policy = BayesianInformationPolicy()
-
-    information_policy.validate()
-
-    player_ids = tuple(str(dc_id) for dc_id in static_context.edge_dc_ids)
-
-    if not player_ids:
-        raise RuntimeError("Bayesian Routing Game 至少需要 " "一个 Edge DC player。")
-
-    if len(set(player_ids)) != len(player_ids):
-        raise RuntimeError("Bayesian Routing Game 中存在重复 Edge DC ID。")
-
-    action_target_dc_ids = tuple(
-        str(dc_id) for dc_id in static_context.routing_action_target_dc_ids
-    )
-
-    if not action_target_dc_ids:
-        raise RuntimeError("Routing action target 不能为空。")
-
-    if len(set(action_target_dc_ids)) != len(action_target_dc_ids):
-        raise RuntimeError("Routing action target 存在重复。")
-
-    player_set = set(player_ids)
-
-    target_set = set(action_target_dc_ids)
-
-    missing_self_targets = player_set - target_set
-
-    if missing_self_targets:
-
-        raise RuntimeError(
-            "Bayesian Routing Game 缺少 Self action：" f"{sorted(missing_self_targets)}"
-        )
-
-    cloud_enabled = bool(static_context.cloud_enabled)
-
-    raw_cloud_id = getattr(
-        static_context,
-        "cloud_id",
-        None,
-    )
-
-    cloud_id = (
-        str(raw_cloud_id) if (cloud_enabled and raw_cloud_id is not None) else None
-    )
-
-    non_edge_targets = target_set - player_set
-
-    if cloud_enabled:
-
-        if cloud_id is None:
-
-            raise RuntimeError("Cloud action 已开启，" "但 Environment 缺少 cloud_id。")
-
-        if non_edge_targets != {cloud_id}:
-
-            raise RuntimeError(
-                "非 Edge Routing target "
-                "必须且只能是 Cloud："
-                f"actual={sorted(non_edge_targets)}, "
-                f"cloud={cloud_id}"
-            )
-
-    elif non_edge_targets:
-
-        raise RuntimeError(
-            "Cloud action 已关闭，"
-            "但 Routing action 中仍存在非 Edge target："
-            f"{sorted(non_edge_targets)}"
-        )
-
-    definition = BayesianRoutingGameDefinition(
-        player_ids=(player_ids),
-        action_target_dc_ids=(action_target_dc_ids),
-        cloud_enabled=(cloud_enabled),
-        cloud_id=(cloud_id),
-        remote_type_space=(
-            BayesianHiddenState.GOOD,
-            BayesianHiddenState.NORMAL,
-            BayesianHiddenState.RISKY,
-        ),
-        information_policy=(information_policy),
-    )
-
-    for player_id in definition.player_ids:
-
-        definition.action_semantics_for(player_id)
-
-    return definition
-
-
-def _get_terminal_outcome_facts(
-    finalized_trace: FinalizedJobTrace,
-    env: Any,
-) -> Tuple[bool, bool, Optional[float], float]:
-    """从终止任务和环境中的静态任务元数据提取历史结果。"""
-
-    job_id = str(finalized_trace.job_id)
-    job = env.job_map.get(job_id)
-    if job is None:
-        raise RuntimeError("Bayesian Evidence 无法找到 terminal Job：" f"{job_id}")
-
-    completed = str(finalized_trace.terminal_reason) == "completed"
-    completion_time_s: Optional[float] = None
-    normalized_latency_score = 0.0
-    sla_satisfied = False
-
-    if completed:
-        turnaround_time = job.get_turnaround_time()
-        if turnaround_time is None:
-            turnaround_time = max(
-                float(finalized_trace.terminal_time) - float(job.arrive_time),
-                0.0,
-            )
-
-        completion_time_s = max(float(turnaround_time), 0.0)
-        sla_limit_s = max(
-            float(env.sla_deadline_ratio) * float(job.duration),
-            1e-9,
-        )
-        sla_satisfied = bool(completion_time_s <= sla_limit_s + 1e-9)
-
-        normalized_latency_score = min(
-            1.0,
-            max(
-                0.0,
-                sla_limit_s / max(completion_time_s, 1e-9),
-            ),
-        )
-
-    return (
-        completed,
-        sla_satisfied,
-        completion_time_s,
-        normalized_latency_score,
-    )
-
-
-def build_bayesian_evidence_from_finalized_trace(
-    finalized_trace: FinalizedJobTrace,
-    env: Any,
-) -> Tuple[BayesianHistoricalEvidence, ...]:
-    """将一个 FinalizedJobTrace 转换为有向 Pair Evidence 集合。
-
-    转换规则：
-
-    * 只处理 ``action_type == "edge_dc"`` 的 source -> target 选择；
-    * 必须存在同一 Job 的下一 Routing Step，且 agent_id 等于 target；
-    * 下一步为 ``edge_dc`` 或 ``cloud`` 时保留 reforwarded 诊断字段；
-    * terminal 失败或 SLA 违约会生成终局风险证据；
-    * reforwarded 由独立吸收信念处理，不重复进入终局拥塞后验；
-    * 每条 Evidence 生成后立即执行信息边界校验。
-    """
-
-    (
-        completed,
-        sla_satisfied,
-        completion_time_s,
-        normalized_latency_score,
-    ) = _get_terminal_outcome_facts(
-        finalized_trace,
-        env,
-    )
-
-    routing_steps = tuple(finalized_trace.routing_steps)
-    evidences = []
-
-    for step_index, routing_step in enumerate(routing_steps):
-        if str(routing_step.action_type) != "edge_dc":
-            continue
-
-        source_dc_id = str(routing_step.source_dc_id)
-        if routing_step.target_dc_id is None:
-            raise RuntimeError(
-                "Finalized Edge Routing 缺少 target_dc_id："
-                f"job={finalized_trace.job_id}, "
-                f"sequence={routing_step.sequence_index}"
-            )
-
-        target_dc_id = str(routing_step.target_dc_id)
-        next_step_index = step_index + 1
-        if next_step_index >= len(routing_steps):
-            raise RuntimeError(
-                "Bayesian Evidence 找不到 Edge Routing 的后继 Step："
-                f"job={finalized_trace.job_id}, "
-                f"sequence={routing_step.sequence_index}, "
-                f"source={source_dc_id}, target={target_dc_id}"
-            )
-
-        next_routing_step = routing_steps[next_step_index]
-        actual_target = str(next_routing_step.agent_id)
-        if actual_target != target_dc_id:
-            raise RuntimeError(
-                "Bayesian Evidence 的 Routing 因果链 target 不一致："
-                f"job={finalized_trace.job_id}, "
-                f"expected={target_dc_id}, actual={actual_target}"
-            )
-
-        reforwarded = str(next_routing_step.action_type) in {
-            "edge_dc",
-            "cloud",
-        }
-        outcome_type = classify_historical_outcome(
-            success=completed,
-            sla_satisfied=sla_satisfied,
-            normalized_latency_score=normalized_latency_score,
-            reforwarded=reforwarded,
-        )
-
-        evidence = BayesianHistoricalEvidence(
-            source_dc_id=source_dc_id,
-            target_dc_id=target_dc_id,
-            outcome_type=outcome_type,
-            success=completed,
-            sla_satisfied=sla_satisfied,
-            reforwarded=reforwarded,
-            evidence_weight=1.0,
-            normalized_latency_score=normalized_latency_score,
-            normalized_energy_score=0.0,
-            completion_time_s=completion_time_s,
-            timestamp=float(finalized_trace.terminal_time),
-            routing_time=float(routing_step.env_time),
-            evidence_id=f"{finalized_trace.job_id}:{routing_step.sequence_index}",
-        )
-        evidence.validate_information_boundary()
-        evidences.append(evidence)
-
-    return tuple(evidences)
-
-
-"""Congestion beliefs and short-window runtime."""
-
-import json
-import math
-from dataclasses import asdict, dataclass
-from pathlib import Path
-from typing import Mapping
-
-
-def positive(value, name, *, zero=False):
-    value = float(value)
-    if not math.isfinite(value) or (value < 0 if zero else value <= 0):
-        raise ValueError(
-            f"{name} must be finite and {'nonnegative' if zero else 'positive'}"
-        )
-    return value
-
-
-@dataclass(frozen=True)
-class BayesianCongestionPairKey:
-    source_dc_id: str
-    target_dc_id: str
-
-
-@dataclass(frozen=True)
-class StaticDCCapacity:
-    cpu: float
-    gpu: float
-    hosts: tuple[tuple[float, float], ...]
-
-    def __post_init__(self):
-        positive(self.cpu, "cpu capacity", zero=True)
-        positive(self.gpu, "gpu capacity", zero=True)
-        for cpu, gpu in self.hosts:
-            positive(cpu, "host cpu", zero=True)
-            positive(gpu, "host gpu", zero=True)
-
-    def fits(self, cpu, gpu):
-        return any(cpu <= c + 1e-9 and gpu <= g + 1e-9 for c, g in self.hosts)
-
-
-@dataclass(frozen=True)
-class LocalSourceSignal:
-    waiting_volume: float = 0.0
-    running_volume: float = 0.0
-    effective_events: float = 0.0
-
-
-@dataclass(frozen=True)
-class RoutingActionFeatures:
-    target_dc_id: str
-    success_score: float = 0.5
-    sla_score: float = 0.5
-    delay_score: float = 0.5
-    cpu_request: float = 0.0
-    gpu_request: float = 0.0
-    source_signal: LocalSourceSignal = LocalSourceSignal()
-
-
-@dataclass(frozen=True)
-class ActionUtilityBreakdown:
-    target_dc_id: str
-    benefit: float
-    congestion_probability: float
-    congestion_cost: float
-    risk: float
-    utility: float
-    confidence: float
-    bias: float
-    outcome_probability: float = 0.5
-    source_signal: float = 0.0
-    source_pseudo_count: float = 0.0
-    source_confidence: float = 0.0
-    outcome_confidence: float = 0.0
-    resource_cost_raw: float = 0.0
-    feasible: bool = True
-    guidance_utility: float = 0.0
-    outcome_samples: float = 0.0
-    cpu_pressure: float = 0.0
-    gpu_pressure: float = 0.0
-    cpu_request: float = 0.0
-    gpu_request: float = 0.0
-    absorption_probability: float = 0.0
-    edge_reforward_probability: float = 0.0
-    cloud_escape_probability: float = 0.0
-    absorption_drop_probability: float = 0.0
-    absorption_confidence: float = 0.0
-    absorption_pair_samples: float = 0.0
-    absorption_class_samples: float = 0.0
-    absorption_class_mix: float = 0.0
-    absorption_resource_class: str = ""
-    transit_penalty_raw: float = 0.0
-    transit_penalty: float = 0.0
-
-
-@dataclass
-class BetaBeliefState:
-    alpha_congested: float = 1.0
-    beta_non_congested: float = 1.0
-    sample_weight: float = 0.0
-    last_update_clock: float | None = None
-
-    @property
-    def congestion_probability(self):
-        return self.alpha_congested / (self.alpha_congested + self.beta_non_congested)
-
-    def confidence(self, confidence_scale):
-        return self.sample_weight / (
-            self.sample_weight + positive(confidence_scale, "confidence_scale")
-        )
-
-
-ABSORPTION_OUTCOMES = ("self", "edge", "cloud", "drop")
-
-
-@dataclass(frozen=True)
-class AbsorptionEvidence:
-    """Observed successor of one executed source->target edge transfer."""
-
-    event_id: str
-    job_id: str
-    source_dc_id: str
-    target_dc_id: str
-    routed_at: float
-    observed_at: float
-    outcome: str
-    cpu_request: float
-    gpu_request: float
-    resource_class: str
-    predecessor_action_source: str
-    successor_action_source: str
-    informative: bool = True
-
-    def __post_init__(self):
-        if not self.event_id or not self.job_id:
-            raise ValueError("Absorption evidence requires event_id and job_id")
-        if (
-            not self.source_dc_id
-            or not self.target_dc_id
-            or self.source_dc_id == self.target_dc_id
-        ):
-            raise ValueError("Absorption evidence requires a directed non-self DC pair")
-        if self.outcome not in ABSORPTION_OUTCOMES:
-            raise ValueError(f"Unknown absorption outcome: {self.outcome}")
-        positive(self.routed_at, "routed_at", zero=True)
-        positive(self.observed_at, "observed_at", zero=True)
-        if self.observed_at + 1e-9 < self.routed_at:
-            raise ValueError("Absorption outcome precedes its edge transfer")
-        positive(self.cpu_request, "cpu request", zero=True)
-        positive(self.gpu_request, "gpu request", zero=True)
-
-
-@dataclass(frozen=True)
-class AbsorptionBeliefState:
-    p_absorb: float
-    p_edge: float
-    p_cloud: float
-    p_drop: float
-    confidence: float
-    pair_samples: float
-    class_samples: float
-    class_mix: float
-    resource_class: str
-    counts: Mapping[str, float]
-
-
-class ShortWindowAbsorptionStore:
-    """Dirichlet successor-action beliefs for each directed Edge pair."""
-
-    def __init__(
-        self,
-        edge_dc_ids,
-        capacities,
-        *,
-        window_s=1200.0,
-        priors=None,
-        confidence_scale=8.0,
-        demand_thresholds=(0.25, 0.60),
-        class_confidence_scale=4.0,
-    ):
-        self.edge_dc_ids = tuple(map(str, edge_dc_ids))
-        self.capacities = dict(capacities)
-        self.window_s = positive(window_s, "absorption window")
-        priors = priors or {name: 1.0 for name in ABSORPTION_OUTCOMES}
-        if set(priors) != set(ABSORPTION_OUTCOMES):
-            raise ValueError("Absorption priors must cover self/edge/cloud/drop")
-        self.priors = {
-            name: positive(priors[name], f"{name} prior")
-            for name in ABSORPTION_OUTCOMES
-        }
-        self.confidence_scale = positive(
-            confidence_scale, "absorption confidence scale"
-        )
-        thresholds = tuple(float(x) for x in demand_thresholds)
-        if len(thresholds) != 2 or not 0 < thresholds[0] < thresholds[1]:
-            raise ValueError("Demand thresholds must be two increasing positive values")
-        self.demand_thresholds = thresholds
-        self.class_confidence_scale = positive(
-            class_confidence_scale, "absorption class confidence scale"
-        )
-        self.reset()
-
-    def reset(self):
-        self.now = 0.0
-        self._records = {}
-        self._seen_event_ids = set()
-        self._episode_counts = {name: 0 for name in ABSORPTION_OUTCOMES}
-        self._episode_informative_counts = {name: 0 for name in ABSORPTION_OUTCOMES}
-        self._episode_pair_counts = {}
-
-    def advance_time(self, now):
-        now = positive(now, "simulation time", zero=True)
-        if now < self.now - 1e-9:
-            raise ValueError("Simulation clock moved backwards")
-        self.now = now
-        self._records = {
-            key: record
-            for key, record in self._records.items()
-            if record.observed_at > now - self.window_s
-        }
-
-    def resource_class(self, target_dc_id, cpu_request, gpu_request):
-        capacity = self.capacities[str(target_dc_id)]
-        max_cpu = max((cpu for cpu, _ in capacity.hosts), default=0.0)
-        max_gpu = max((gpu for _, gpu in capacity.hosts), default=0.0)
-        cpu_ratio = float(cpu_request) / max_cpu if max_cpu > 0 else 0.0
-        gpu_ratio = float(gpu_request) / max_gpu if max_gpu > 0 else 0.0
-        dominant = max(cpu_ratio, gpu_ratio)
-        if dominant < self.demand_thresholds[0]:
-            size = "low"
-        elif dominant < self.demand_thresholds[1]:
-            size = "medium"
-        else:
-            size = "high"
-        return f"{'gpu' if float(gpu_request) > 0 else 'cpu'}:{size}"
-
-    def record(self, evidence):
-        if not isinstance(evidence, AbsorptionEvidence):
-            raise TypeError("Expected AbsorptionEvidence")
-        if (
-            evidence.source_dc_id not in self.capacities
-            or evidence.target_dc_id not in self.capacities
-        ):
-            raise KeyError(
-                f"Unknown absorption pair: {evidence.source_dc_id}->{evidence.target_dc_id}"
-            )
-        if evidence.event_id in self._seen_event_ids:
-            return False
-        self.advance_time(max(self.now, evidence.observed_at))
-        self._seen_event_ids.add(evidence.event_id)
-        if evidence.observed_at > self.now - self.window_s:
-            self._records[evidence.event_id] = evidence
-        self._episode_counts[evidence.outcome] += 1
-        if evidence.informative:
-            self._episode_informative_counts[evidence.outcome] += 1
-        pair = f"{evidence.source_dc_id}->{evidence.target_dc_id}"
-        pair_counts = self._episode_pair_counts.setdefault(
-            pair, {name: 0 for name in ABSORPTION_OUTCOMES}
-        )
-        pair_counts[evidence.outcome] += 1
-        return True
-
-    def records(self, source_dc_id, target_dc_id, *, informative_only=True):
-        source_dc_id, target_dc_id = str(source_dc_id), str(target_dc_id)
-        return tuple(
-            r
-            for r in self._records.values()
-            if r.source_dc_id == source_dc_id
-            and r.target_dc_id == target_dc_id
-            and (r.informative or not informative_only)
-        )
-
-    def belief(self, source_dc_id, target_dc_id, cpu_request=0.0, gpu_request=0.0):
-        target_dc_id = str(target_dc_id)
-        resource_class = self.resource_class(target_dc_id, cpu_request, gpu_request)
-        pair_records = self.records(source_dc_id, target_dc_id)
-        class_records = tuple(
-            r for r in pair_records if r.resource_class == resource_class
-        )
-
-        def posterior(records):
-            counts = {
-                name: sum(r.outcome == name for r in records)
-                for name in ABSORPTION_OUTCOMES
-            }
-            total = sum(counts.values())
-            denominator = sum(self.priors.values()) + total
-            probabilities = {
-                name: (self.priors[name] + counts[name]) / denominator
-                for name in ABSORPTION_OUTCOMES
-            }
-            return counts, float(total), probabilities
-
-        pair_counts, pair_n, pair_p = posterior(pair_records)
-        _, class_n, class_p = posterior(class_records)
-        class_mix = class_n / (class_n + self.class_confidence_scale)
-        probabilities = {
-            name: class_mix * class_p[name] + (1.0 - class_mix) * pair_p[name]
-            for name in ABSORPTION_OUTCOMES
-        }
-        confidence = pair_n / (pair_n + self.confidence_scale)
-        return AbsorptionBeliefState(
-            p_absorb=probabilities["self"],
-            p_edge=probabilities["edge"],
-            p_cloud=probabilities["cloud"],
-            p_drop=probabilities["drop"],
-            confidence=confidence,
-            pair_samples=pair_n,
-            class_samples=class_n,
-            class_mix=class_mix,
-            resource_class=resource_class,
-            counts=pair_counts,
-        )
-
-    def snapshot(self):
-        result = {}
-        pairs = {(r.source_dc_id, r.target_dc_id) for r in self._records.values()}
-        for source, target in sorted(pairs):
-            records = self.records(source, target)
-            result[f"{source}->{target}"] = {
-                name: sum(r.outcome == name for r in records)
-                for name in ABSORPTION_OUTCOMES
-            }
-        return result
-
-    def episode_summary(self):
-        total = sum(self._episode_counts.values())
-        informative = sum(self._episode_informative_counts.values())
-        return {
-            "total": total,
-            "informative_total": informative,
-            "counts": dict(self._episode_counts),
-            "informative_counts": dict(self._episode_informative_counts),
-            "pair_counts": {
-                key: dict(value) for key, value in self._episode_pair_counts.items()
-            },
-            "edge_to_cloud_transit_rate": (
-                self._episode_counts["cloud"] / total if total else 0.0
-            ),
-            "edge_to_edge_reforward_rate": (
-                self._episode_counts["edge"] / total if total else 0.0
-            ),
-            "edge_target_absorption_rate": (
-                self._episode_counts["self"] / total if total else 0.0
-            ),
-        }
-
-
-class BayesianBeliefStore:
-    def __init__(
-        self,
-        edge_dc_ids,
-        *,
-        prior_alpha=1.0,
-        prior_beta=1.0,
-        confidence_scale=20.0,
-        window_s=1200.0,
-    ):
-        self.edge_dc_ids = tuple(map(str, edge_dc_ids))
-        self.prior_alpha = positive(prior_alpha, "prior_alpha")
-        self.prior_beta = positive(prior_beta, "prior_beta")
-        self.confidence_scale = positive(confidence_scale, "confidence_scale")
-        self.window_s = positive(window_s, "window_s")
-        self.reset()
-
-    def reset(self):
-        self.now = 0.0
-        self._records = {
-            (i, j): {} for i in self.edge_dc_ids for j in self.edge_dc_ids if i != j
-        }
-
-    def advance_time(self, now):
-        now = positive(now, "simulation time", zero=True)
-        if now < self.now - 1e-9:
-            raise ValueError(
-                "Simulation clock moved backwards; reset the episode first"
-            )
-        self.now = now
-        for records in self._records.values():
-            for key in tuple(records):
-                if records[key].routing_time <= now - self.window_s:
-                    del records[key]
-
-    def records(self, source_dc_id, target_dc_id):
-        return tuple(self._records[(str(source_dc_id), str(target_dc_id))].values())
-
-    def update(self, evidence: BayesianHistoricalEvidence, *, update_clock=None):
-        evidence.validate_information_boundary()
-        if (
-            evidence.timestamp is None
-            or evidence.routing_time is None
-            or not evidence.evidence_id
-        ):
-            raise ValueError(
-                "Window evidence requires terminal time, routing time and a unique ID"
-            )
-        terminal = positive(evidence.timestamp, "terminal time", zero=True)
-        routed = positive(evidence.routing_time, "routing time", zero=True)
-        if routed > terminal:
-            raise ValueError("Outcome precedes routing")
-        self.advance_time(
-            max(self.now, terminal) if update_clock is None else update_clock
-        )
-        if terminal > self.now + 1e-9:
-            raise ValueError("Future outcome cannot be used")
-        records = self._records[(evidence.source_dc_id, evidence.target_dc_id)]
-        if routed > self.now - self.window_s:
-            records.setdefault(evidence.evidence_id, evidence)
-        return self.get_state(evidence.source_dc_id, evidence.target_dc_id)
-
-    def get_state(self, source_dc_id, target_dc_id):
-        records = self.records(source_dc_id, target_dc_id)
-        bad = sum(e.evidence_weight for e in records if e.congestion_observed)
-        good = sum(e.evidence_weight for e in records if not e.congestion_observed)
-        return BetaBeliefState(
-            self.prior_alpha + bad,
-            self.prior_beta + good,
-            bad + good,
-            max((e.timestamp for e in records), default=None),
-        )
-
-    def get_congestion_probability(self, source_dc_id, target_dc_id):
-        return self.get_state(source_dc_id, target_dc_id).congestion_probability
-
-    def get_confidence(self, source_dc_id, target_dc_id):
-        return self.get_state(source_dc_id, target_dc_id).confidence(
-            self.confidence_scale
-        )
-
-    def snapshot(self):
-        result = {}
-        for i, j in self._records:
-            state = self.get_state(i, j)
-            result[f"{i}->{j}"] = dict(
-                alpha_congested=state.alpha_congested,
-                beta_non_congested=state.beta_non_congested,
-                sample_weight=state.sample_weight,
-                congestion_probability=state.congestion_probability,
-                confidence=state.confidence(self.confidence_scale),
-            )
-        return result
-
-
-class HistoricalPressureStore:
-    """Executed edge transfers within (now-T, now], weighted by CPU/GPU demand."""
-
-    def __init__(
-        self,
-        capacities: Mapping[str, StaticDCCapacity],
-        *,
-        window_s=1200.0,
-        linear_cost_weight=1.0,
-        quadratic_cost_weight=1.0,
-        cpu_weight=0.5,
-        gpu_weight=0.5,
-    ):
-        self.capacities = dict(capacities)
-        self.edge_dc_ids = tuple(self.capacities)
-        self.window_s = positive(window_s, "window_s")
-        self.linear_cost_weight = positive(linear_cost_weight, "linear cost", zero=True)
-        self.quadratic_cost_weight = positive(
-            quadratic_cost_weight, "quadratic cost", zero=True
-        )
-        self.weights = (
-            positive(cpu_weight, "cpu weight", zero=True),
-            positive(gpu_weight, "gpu weight", zero=True),
-        )
-        positive(sum(self.weights), "resource weight sum")
-        self.reset()
-
-    def reset(self):
-        self.now = 0.0
-        self._records = {}
-
-    def advance_time(self, now):
-        now = positive(now, "simulation time", zero=True)
-        if now < self.now - 1e-9:
-            raise ValueError("Simulation clock moved backwards")
-        self.now = now
-        self._records = {
-            k: v for k, v in self._records.items() if v[0] > now - self.window_s
-        }
-
-    def record_selection(
-        self, target_dc_id, *, event_id, event_time, cpu_request, gpu_request
-    ):
-        if target_dc_id not in self.capacities:
-            raise KeyError(target_dc_id)
-        cpu = positive(cpu_request, "cpu request", zero=True)
-        gpu = positive(gpu_request, "gpu request", zero=True)
-        event_time = positive(event_time, "event time", zero=True)
-        if event_time > self.now + 1e-9:
-            raise ValueError("Transfer has not occurred")
-        if event_time > self.now - self.window_s:
-            self._records.setdefault(event_id, (event_time, target_dc_id, cpu, gpu))
-
-    def get_pressure(self, target_dc_id):
-        capacity = self.capacities[target_dc_id]
-        selected = [r for r in self._records.values() if r[1] == target_dc_id]
-        return tuple(
-            sum(r[index + 2] for r in selected) / cap if cap > 0 else 0.0
-            for index, cap in enumerate((capacity.cpu, capacity.gpu))
-        )
-
-    def get_congestion_cost(self, target_dc_id, cpu_request=0.0, gpu_request=0.0):
-        cpu_request = positive(cpu_request, "cpu request", zero=True)
-        gpu_request = positive(gpu_request, "gpu request", zero=True)
-        capacity = self.capacities[target_dc_id]
-        if not capacity.fits(cpu_request, gpu_request):
-            return math.inf
-        cost = 0.0
-        for x, demand, cap, weight in zip(
-            self.get_pressure(target_dc_id),
-            (cpu_request, gpu_request),
-            (capacity.cpu, capacity.gpu),
-            self.weights,
-        ):
-            delta = demand / cap if cap > 0 else 0.0
-            cost += weight * (
-                self.linear_cost_weight * delta
-                + self.quadratic_cost_weight * (2 * x * delta + delta * delta)
-            )
-        return cost
-
-    def snapshot(self):
-        return {
-            j: dict(
-                cpu_pressure=self.get_pressure(j)[0],
-                gpu_pressure=self.get_pressure(j)[1],
-                recent_selection_count=sum(r[1] == j for r in self._records.values()),
-            )
-            for j in self.edge_dc_ids
-        }
-
-
-class BayesianCongestionGame:
-    def __init__(
-        self,
-        game_definition,
-        *,
-        capacities,
-        prior_alpha=1.0,
-        prior_beta=1.0,
-        confidence_scale=20.0,
-        window_s=1200.0,
-        linear_cost_weight=1.0,
-        quadratic_cost_weight=1.0,
-        benefit_success_weight=0.4,
-        benefit_sla_weight=0.4,
-        benefit_delay_weight=0.2,
-        risk_congestion_cost_weight=1.0,
-        source_evidence_weight=2.0,
-        source_volume_scale=1.0,
-        source_confidence_scale=5.0,
-        cpu_weight=0.5,
-        gpu_weight=0.5,
-        resource_cost_scale=1.0,
-        absorption_enabled=True,
-        absorption_priors=None,
-        absorption_confidence_scale=8.0,
-        absorption_edge_weight=0.7,
-        absorption_cloud_weight=0.5,
-        absorption_drop_weight=1.0,
-        absorption_demand_thresholds=(0.25, 0.60),
-        absorption_class_confidence_scale=4.0,
-        absorption_policy_actions_only=True,
-    ):
-        self.game_definition = game_definition
-        if set(capacities) != set(game_definition.player_ids):
-            raise ValueError("Static capacities must cover exactly the edge players")
-        self.belief_store = BayesianBeliefStore(
-            game_definition.player_ids,
-            prior_alpha=prior_alpha,
-            prior_beta=prior_beta,
-            confidence_scale=confidence_scale,
-            window_s=window_s,
-        )
-        self.pressure_store = HistoricalPressureStore(
-            capacities,
-            window_s=window_s,
-            linear_cost_weight=linear_cost_weight,
-            quadratic_cost_weight=quadratic_cost_weight,
-            cpu_weight=cpu_weight,
-            gpu_weight=gpu_weight,
-        )
-        self.absorption_enabled = bool(absorption_enabled)
-        self.absorption_policy_actions_only = bool(absorption_policy_actions_only)
-        self.absorption_store = ShortWindowAbsorptionStore(
-            game_definition.player_ids,
-            capacities,
-            window_s=window_s,
-            priors=absorption_priors,
-            confidence_scale=absorption_confidence_scale,
-            demand_thresholds=absorption_demand_thresholds,
-            class_confidence_scale=absorption_class_confidence_scale,
-        )
-        self.absorption_weights = {
-            "edge": positive(
-                absorption_edge_weight, "absorption edge weight", zero=True
-            ),
-            "cloud": positive(
-                absorption_cloud_weight, "absorption cloud weight", zero=True
-            ),
-            "drop": positive(
-                absorption_drop_weight, "absorption drop weight", zero=True
-            ),
-        }
-        self.benefit_weights = tuple(
-            positive(w, "benefit weight", zero=True)
-            for w in (benefit_success_weight, benefit_sla_weight, benefit_delay_weight)
-        )
-        positive(sum(self.benefit_weights), "benefit weight sum")
-        self.risk_congestion_cost_weight = positive(
-            risk_congestion_cost_weight, "risk weight", zero=True
-        )
-        self.source_evidence_weight = positive(
-            source_evidence_weight, "source weight", zero=True
-        )
-        self.source_volume_scale = positive(source_volume_scale, "source volume scale")
-        self.source_confidence_scale = positive(
-            source_confidence_scale, "source confidence scale"
-        )
-        self.resource_cost_scale = positive(resource_cost_scale, "resource cost scale")
-
-    def reset(self):
-        self.belief_store.reset()
-        self.pressure_store.reset()
-        self.absorption_store.reset()
-
-    def advance_time(self, now):
-        self.belief_store.advance_time(now)
-        self.pressure_store.advance_time(now)
-        self.absorption_store.advance_time(now)
-
-    def update_belief(self, evidence, *, update_clock=None):
-        return self.belief_store.update(evidence, update_clock=update_clock)
-
-    def get_congestion_probability(self, source_dc_id, target_dc_id):
-        return self.belief_store.get_congestion_probability(source_dc_id, target_dc_id)
-
-    def update_pressure(self, source_dc_id, target_dc_id, **kwargs):
-        self.belief_store.get_state(source_dc_id, target_dc_id)
-        return self.pressure_store.record_selection(target_dc_id, **kwargs)
-
-    def record_absorption(self, evidence):
-        return self.absorption_store.record(evidence)
-
-    def get_absorption_belief(
-        self, source_dc_id, target_dc_id, cpu_request=0.0, gpu_request=0.0
-    ):
-        return self.absorption_store.belief(
-            source_dc_id, target_dc_id, cpu_request, gpu_request
-        )
-
-    def get_pressure(self, target_dc_id):
-        return self.pressure_store.get_pressure(target_dc_id)
-
-    def get_congestion_cost(self, target_dc_id, cpu_request=0.0, gpu_request=0.0):
-        return self.pressure_store.get_congestion_cost(
-            target_dc_id, cpu_request, gpu_request
-        )
-
-    def calculate_benefit(self, action):
-        values = (action.success_score, action.sla_score, action.delay_score)
-        if any(not math.isfinite(v) or not 0 <= v <= 1 for v in values):
-            raise ValueError("Quality scores must lie in [0,1]")
-        return sum(w * v for w, v in zip(self.benefit_weights, values))
-
-    def evaluate_actions(self, source_dc_id, job_context):
-        if not job_context:
-            raise ValueError("No candidate actions")
-        rows = []
-        for target, raw in job_context.items():
-            action = (
-                raw
-                if isinstance(raw, RoutingActionFeatures)
-                else RoutingActionFeatures(**raw)
-            )
-            if target != action.target_dc_id:
-                raise ValueError("Candidate target mismatch")
-            benefit = self.calculate_benefit(action)
-            remote = target in self.pressure_store.capacities and target != source_dc_id
-            row = dict(
-                target_dc_id=target,
-                benefit=benefit,
-                congestion_probability=0.0,
-                congestion_cost=0.0,
-                risk=0.0,
-                utility=benefit,
-                confidence=1.0,
-                bias=0.0,
-                guidance_utility=benefit,
-                cpu_request=action.cpu_request,
-                gpu_request=action.gpu_request,
-            )
-            if remote:
-                state = self.belief_store.get_state(source_dc_id, target)
-                local = action.source_signal
-                volume = positive(
-                    local.waiting_volume, "waiting volume", zero=True
-                ) + positive(local.running_volume, "running volume", zero=True)
-                events = positive(local.effective_events, "source events", zero=True)
-                signal = volume / (volume + self.source_volume_scale)
-                pseudo = self.source_evidence_weight * signal
-                source_conf = (
-                    events / (events + self.source_confidence_scale)
-                    if pseudo > 0
-                    else 0.0
-                )
-                out_conf = state.confidence(self.belief_store.confidence_scale)
-                fused = (state.alpha_congested + pseudo) / (
-                    state.alpha_congested + state.beta_non_congested + pseudo
-                )
-                cost = self.get_congestion_cost(
-                    target, action.cpu_request, action.gpu_request
-                )
-                feasible = math.isfinite(cost)
-                normalized_cost = (
-                    cost / (cost + self.resource_cost_scale) if feasible else 1.0
-                )
-                confidence = 1 - (1 - out_conf) * (1 - source_conf)
-                effective_probability = (
-                    0.5
-                    + out_conf * (state.congestion_probability - 0.5)
-                    + source_conf * (fused - state.congestion_probability)
-                )
-                absorption = self.get_absorption_belief(
-                    source_dc_id, target, action.cpu_request, action.gpu_request
-                )
-                transit_raw = (
-                    self.absorption_weights["edge"] * absorption.p_edge
-                    + self.absorption_weights["cloud"] * absorption.p_cloud
-                    + self.absorption_weights["drop"] * absorption.p_drop
-                )
-                transit_penalty = (
-                    absorption.confidence * transit_raw
-                    if self.absorption_enabled
-                    else 0.0
-                )
-                risk = (
-                    fused
-                    + self.risk_congestion_cost_weight * normalized_cost
-                    + transit_penalty
-                )
-                utility = (
-                    0.5 + out_conf * (benefit - 0.5) - (effective_probability - 0.5)
-                )
-                utility -= self.risk_congestion_cost_weight * normalized_cost
-                utility -= transit_penalty
-                row.update(
-                    congestion_probability=fused,
-                    congestion_cost=normalized_cost,
-                    risk=risk,
-                    utility=benefit - risk,
-                    guidance_utility=utility,
-                    confidence=confidence,
-                    outcome_probability=state.congestion_probability,
-                    source_signal=signal,
-                    source_pseudo_count=pseudo,
-                    source_confidence=source_conf,
-                    outcome_confidence=out_conf,
-                    resource_cost_raw=cost if feasible else 0.0,
-                    feasible=feasible,
-                    outcome_samples=state.sample_weight,
-                    cpu_pressure=self.get_pressure(target)[0],
-                    gpu_pressure=self.get_pressure(target)[1],
-                    absorption_probability=absorption.p_absorb,
-                    edge_reforward_probability=absorption.p_edge,
-                    cloud_escape_probability=absorption.p_cloud,
-                    absorption_drop_probability=absorption.p_drop,
-                    absorption_confidence=absorption.confidence,
-                    absorption_pair_samples=absorption.pair_samples,
-                    absorption_class_samples=absorption.class_samples,
-                    absorption_class_mix=absorption.class_mix,
-                    absorption_resource_class=absorption.resource_class,
-                    transit_penalty_raw=transit_raw,
-                    transit_penalty=transit_penalty,
-                )
-            rows.append(row)
-        return tuple(ActionUtilityBreakdown(**r) for r in rows)
-
-
-def build_short_window_game(env, settings, definition=None):
-    if definition is None:
-        definition = build_bayesian_routing_game_definition(
-            build_bayesian_static_routing_context(env)
-        )
-    return BayesianCongestionGame(
-        definition,
-        capacities=build_static_capacities(env),
-        prior_alpha=settings.bayesian_prior_alpha,
-        prior_beta=settings.bayesian_prior_beta,
-        confidence_scale=settings.bayesian_confidence_scale,
-        window_s=settings.short_window_s,
-        source_evidence_weight=settings.source_evidence_weight,
-        source_volume_scale=settings.source_volume_scale,
-        source_confidence_scale=settings.source_confidence_scale,
-        cpu_weight=settings.resource_cpu_weight,
-        gpu_weight=settings.resource_gpu_weight,
-        resource_cost_scale=settings.resource_cost_scale,
-        linear_cost_weight=settings.pressure_linear_cost_weight,
-        quadratic_cost_weight=settings.pressure_quadratic_cost_weight,
-        benefit_success_weight=settings.benefit_success_weight,
-        benefit_sla_weight=settings.benefit_sla_weight,
-        benefit_delay_weight=settings.benefit_delay_weight,
-        risk_congestion_cost_weight=settings.risk_congestion_cost_weight,
-        absorption_enabled=settings.absorption_enabled,
-        absorption_priors={
-            "self": settings.absorption_prior_self,
-            "edge": settings.absorption_prior_edge,
-            "cloud": settings.absorption_prior_cloud,
-            "drop": settings.absorption_prior_drop,
-        },
-        absorption_confidence_scale=settings.absorption_confidence_scale,
-        absorption_edge_weight=settings.absorption_edge_weight,
-        absorption_cloud_weight=settings.absorption_cloud_weight,
-        absorption_drop_weight=settings.absorption_drop_weight,
-        absorption_demand_thresholds=settings.absorption_demand_thresholds,
-        absorption_class_confidence_scale=settings.absorption_class_confidence_scale,
-        absorption_policy_actions_only=settings.absorption_policy_actions_only,
-    )
-
-
-def build_static_capacities(env):
-    """One-time whitelist: installed CPU/GPU only, never used/available resources."""
-    result = {}
-    base_dc_map = {str(dc.dc_id): dc for dc in env.base_datacenters}
-    for dc_id in env.edge_dc_ids:
-        hosts = tuple(
-            (float(h.cpu_num), float(h.gpu_capacity_num))
-            for h in base_dc_map[dc_id].host_list
-        )
-        result[str(dc_id)] = StaticDCCapacity(
-            sum(c for c, _ in hosts), sum(g for _, g in hosts), hosts
-        )
-    return result
-
-
-@dataclass(frozen=True)
-class LocalReceipt:
-    previous_dc_id: str
-    received_at: float
-    event_id: str
-    informative: bool
-
-
-@dataclass(frozen=True)
-class PendingAbsorption:
-    job_id: str
-    source_dc_id: str
-    target_dc_id: str
-    event_id: str
-    routed_at: float
-    cpu_request: float
-    gpu_request: float
-    predecessor_action_source: str
-
-
-class ShortWindowRuntime:
-    def __init__(self, game):
-        self.game = game
-        self.policy_actions_only = bool(game.absorption_policy_actions_only)
-        self.reset()
-
-    def reset(self):
-        self.game.reset()
-        self._pending_arrivals = {}
-        self._pending_absorption = {}
-        self._pending_self = {}
-        self._receipts = {i: {} for i in self.game.game_definition.player_ids}
-        self._sequence = 0
-
-    def record_routing(self, decision, action_type, target_dc_id, action_source, job):
-        """Called after env.step succeeded, before building the next observation."""
-        action_type = str(action_type)
-        action_source = str(action_source)
-        job_id = str(decision.job_id)
-        self.game.advance_time(decision.env_time)
-
-        predecessor = self._pending_absorption.pop(job_id, None)
-        if predecessor is not None:
-            if predecessor.target_dc_id != str(decision.agent_id):
-                raise RuntimeError("Absorption successor DC does not match edge target")
-            if action_type == "self":
-                self._pending_self[job_id] = (
-                    predecessor,
-                    float(decision.env_time),
-                    action_source,
-                )
-            else:
-                outcome = {"edge_dc": "edge", "cloud": "cloud", "drop": "drop"}.get(
-                    action_type
-                )
-                if outcome is None:
-                    raise RuntimeError(
-                        f"Unknown absorption successor action: {action_type}"
-                    )
-                self._record_absorption(
-                    predecessor,
-                    outcome,
-                    observed_at=decision.env_time,
-                    successor_action_source=action_source,
-                )
-
-        if action_type != "edge_dc":
-            return
-        self._sequence += 1
-        event_id = f"{job_id}:{self._sequence}"
-        self.game.update_pressure(
-            decision.agent_id,
-            target_dc_id,
-            event_id=event_id,
-            event_time=decision.env_time,
-            cpu_request=job.cpu_request,
-            gpu_request=job.gpu_request,
-        )
-        pending = PendingAbsorption(
-            job_id=job_id,
-            source_dc_id=str(decision.agent_id),
-            target_dc_id=str(target_dc_id),
-            event_id=event_id,
-            routed_at=float(decision.env_time),
-            cpu_request=float(job.cpu_request),
-            gpu_request=float(job.gpu_request),
-            predecessor_action_source=action_source,
-        )
-        self._pending_arrivals[job_id] = pending
-        self._pending_absorption[job_id] = pending
-
-    def _record_absorption(
-        self, pending, outcome, *, observed_at, successor_action_source
-    ):
-        informative = not self.policy_actions_only or (
-            pending.predecessor_action_source == "policy"
-            and str(successor_action_source) == "policy"
-        )
-        resource_class = self.game.absorption_store.resource_class(
-            pending.target_dc_id, pending.cpu_request, pending.gpu_request
-        )
-        return self.game.record_absorption(
-            AbsorptionEvidence(
-                event_id=pending.event_id,
-                job_id=pending.job_id,
-                source_dc_id=pending.source_dc_id,
-                target_dc_id=pending.target_dc_id,
-                routed_at=pending.routed_at,
-                observed_at=float(observed_at),
-                outcome=str(outcome),
-                cpu_request=pending.cpu_request,
-                gpu_request=pending.gpu_request,
-                resource_class=resource_class,
-                predecessor_action_source=pending.predecessor_action_source,
-                successor_action_source=str(successor_action_source),
-                informative=informative,
-            )
-        )
-
-    def record_host_result(self, job_id, dc_id, execution_result, now):
-        """Finalize a provisional SELF successor after the real host admission result."""
-        self.game.advance_time(now)
-        item = self._pending_self.pop(str(job_id), None)
-        if item is None:
-            return False
-        pending, observed_at, successor_action_source = item
-        if pending.target_dc_id != str(dc_id):
-            raise RuntimeError("Host result DC does not match absorption target")
-        execution_result = str(execution_result)
-        if execution_result not in {"started", "queued", "dropped"}:
-            raise ValueError(f"Unknown host execution result: {execution_result}")
-        outcome = "self" if execution_result in {"started", "queued"} else "drop"
-        return self._record_absorption(
-            pending,
-            outcome,
-            observed_at=max(float(observed_at), float(now)),
-            successor_action_source=successor_action_source,
-        )
-
-    def record_arrival(self, dc_id, job_id, now):
-        """Only a real current routing decision makes the receipt visible locally."""
-        self.game.advance_time(now)
-        pending = self._pending_arrivals.get(str(job_id))
-        if pending is not None:
-            if pending.target_dc_id != dc_id:
-                raise RuntimeError("Incoming task target does not match current DC")
-            self._receipts[dc_id][str(job_id)] = LocalReceipt(
-                pending.source_dc_id,
-                now,
-                pending.event_id,
-                pending.predecessor_action_source == "policy",
-            )
-            del self._pending_arrivals[str(job_id)]
-        cutoff = now - self.game.belief_store.window_s
-        for receipts in self._receipts.values():
-            for key in tuple(receipts):
-                if receipts[key].received_at <= cutoff:
-                    del receipts[key]
-
-    def local_source_signals(self, source_dc_id, local_dc, now):
-        """Caller supplies exactly one local DC; no access to an environment here."""
-        self.game.advance_time(now)
-        capacity = self.game.pressure_store.capacities[source_dc_id]
-        volumes = {}
-        seen = set()
-        for host in local_dc.host_list:
-            for queue_name, index in (("waiting_queue", 0), ("running_queue", 1)):
-                for job in getattr(host, queue_name)._queue:
-                    job_id = str(job.job_id)
-                    if job_id in seen:
-                        continue
-                    seen.add(job_id)
-                    receipt = self._receipts[source_dc_id].get(job_id)
-                    if receipt is None or not receipt.informative:
-                        continue
-                    age = now - receipt.received_at
-                    if not 0 <= age < self.game.belief_store.window_s:
-                        continue
-                    freshness = 1.0 - age / self.game.belief_store.window_s
-                    volume = max(
-                        float(job.cpu_request) / capacity.cpu if capacity.cpu else 0.0,
-                        float(job.gpu_request) / capacity.gpu if capacity.gpu else 0.0,
-                    )
-                    entry = volumes.setdefault(receipt.previous_dc_id, [0.0, 0.0, 0.0])
-                    entry[index] += freshness * volume
-                    entry[2] += freshness
-        return {j: LocalSourceSignal(*v) for j, v in volumes.items()}
-
-    def build_action_context(self, policy, env, decision, feedback_provider):
-        self.game.advance_time(decision.env_time)
-        signals = self.local_source_signals(
-            decision.agent_id, env.dc_map[decision.agent_id], decision.env_time
-        )
-        job = env.job_map[decision.job_id]
-        return policy.build_action_context(
-            decision.agent_id,
-            feedback_provider,
-            cpu_request=job.cpu_request,
-            gpu_request=job.gpu_request,
-            source_signals=signals,
-        )
-
-    def absorption_summary(self):
-        return self.game.absorption_store.episode_summary()
-
-
-"""Training, evaluation, logs, and checkpoint helpers."""
 
 import csv
 import json
@@ -1954,7 +8,7 @@ import os
 import random
 import sys
 import time
-from dataclasses import asdict, dataclass, field, fields, replace
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -1972,8 +26,9 @@ from .experience import (
     HostReplayBuffer,
     PendingJobTraceStore,
     RoutingReplayBuffer,
+    RoutingReplayBuffers,
 )
-from .h_masac_agent import (
+from .mr_h_masac_agent import (
     HostSACConfig,
     LocalHostSAC,
     RoutingMASAC,
@@ -1985,14 +40,14 @@ from .observations import (
     NeighborHistoricalFeedbackStore,
     RoutingCentralizedStateBuilder,
     RoutingObservationBuilder,
-    ShortWindowFeedbackStore,
 )
 
 
+# Training reward
 @dataclass(frozen=True)
 class TrainingRewardConfig:
     """
-    H-MASAC Training Reward 参数。
+    MR-H-MASAC Training Reward 参数。
 
     注意：
         这里的参数属于“学习目标”，
@@ -2024,6 +79,7 @@ class TrainingRewardConfig:
     energy_normalization_j: float
     energy_cost_weight: float
 
+    # 当前 Reward 归一化需要的环境固定尺度。
     max_latency_s: float
     max_job_duration_s: float
 
@@ -2035,7 +91,7 @@ class TrainingRewardConfig:
 
 class HMasacTrainingRewardModel:
     """
-    H-MASAC 两层训练系统使用的 Reward Model。
+    MR-H-MASAC 两层训练系统使用的 Reward Model。
 
     本类不：
         - 推进 Environment；
@@ -2069,6 +125,10 @@ class HMasacTrainingRewardModel:
 
         if float(config.max_job_duration_s) <= 0.0:
             raise ValueError("max_job_duration_s 必须 > 0。")
+
+    # ==========================================================
+    # Helpers
+    # ==========================================================
 
     def _normalize(
         self,
@@ -2141,6 +201,10 @@ class HMasacTrainingRewardModel:
 
         return float(float(self.config.energy_cost_weight) * energy_cost)
 
+    # ==========================================================
+    # Routing Immediate Reward
+    # ==========================================================
+
     def calculate_routing_immediate_reward(
         self,
         facts: Mapping[
@@ -2169,8 +233,16 @@ class HMasacTrainingRewardModel:
 
         action_type = str(facts["action_type"])
 
+        # ------------------------------------------------------
+        # Self
+        # ------------------------------------------------------
+
         if action_type == "self":
             return 0.0
+
+        # ------------------------------------------------------
+        # Forced / Environment Drop
+        # ------------------------------------------------------
 
         if action_type == "drop":
 
@@ -2201,6 +273,10 @@ class HMasacTrainingRewardModel:
                 return -float(float(self.config.resource_drop_penalty) + energy_penalty)
 
             raise ValueError("未知 Routing drop failure_reason：" f"{failure_reason}")
+
+        # ------------------------------------------------------
+        # Edge / Cloud Remote Routing
+        # ------------------------------------------------------
 
         if action_type in {
             "edge_dc",
@@ -2249,11 +325,14 @@ class HMasacTrainingRewardModel:
             return -float(
                 float(self.config.remote_offload_base_penalty)
                 + float(self.config.remote_latency_cost_weight) * remote_latency_cost
-                + float(self.config.sla_risk_cost_weight)
-                * predicted_sla_violation_degree
+                + float(self.config.sla_risk_cost_weight) * predicted_sla_violation_degree
             )
 
         raise ValueError("未知 Routing action_type：" f"{action_type}")
+
+    # ==========================================================
+    # Delayed / Terminal Reward
+    # ==========================================================
 
     def calculate_outcome_reward(
         self,
@@ -2265,7 +344,7 @@ class HMasacTrainingRewardModel:
         """
         Environment Outcome Fact
                 ↓
-        H-MASAC delayed/terminal training reward。
+        MR-H-MASAC delayed/terminal training reward。
 
         当前第三十一步仍保持原有 terminal Reward 数值公式。
         """
@@ -2281,6 +360,10 @@ class HMasacTrainingRewardModel:
 
         energy_penalty = self._calculate_energy_penalty(attributable_energy_j)
 
+        # ------------------------------------------------------
+        # Successful Completion
+        # ------------------------------------------------------
+
         if reason == "completed":
 
             completion_time_s = max(
@@ -2294,8 +377,7 @@ class HMasacTrainingRewardModel:
             )
 
             global_completion_scale_s = max(
-                float(self.config.drop_deadline_ratio)
-                * float(self.config.max_job_duration_s),
+                float(self.config.drop_deadline_ratio) * float(self.config.max_job_duration_s),
                 float(self.config.norm_eps),
             )
 
@@ -2324,12 +406,20 @@ class HMasacTrainingRewardModel:
                 - energy_penalty
             )
 
+        # ------------------------------------------------------
+        # Timeout Failure
+        # ------------------------------------------------------
+
         if reason in {
             "waiting_timeout",
             "local_host_arrival_timeout",
             "cloud_arrival_timeout",
         }:
             return -float(float(self.config.timeout_drop_penalty) + energy_penalty)
+
+        # ------------------------------------------------------
+        # Resource Failure
+        # ------------------------------------------------------
 
         if reason in {
             "local_host_resource_failure",
@@ -2340,28 +430,42 @@ class HMasacTrainingRewardModel:
         raise ValueError("TrainingRewardModel " "收到未知 outcome reason：" f"{reason}")
 
 
+# Environment transition collection
 FloatArray = NDArray[np.float32]
 
 
 class CloudEdgeEnvLike(Protocol):
 
+    # pettingzoo 需要区分全部可能智能体与现在活着的智能体，在我的环境中这俩个没区别
     possible_agents: Sequence[str]
     agents: Sequence[str]
 
+    # 当前执行step的智能体与当前做决策的智能体，在我环境中这两个也相同
     agent_selection: Optional[str]
     current_agent_id: Optional[str]
 
+    # current_job_id: Optional[str]
+    # pending_host_job_id: Optional[str]
+    # pending_host_dc_id: Optional[str]
     current_job_id: Optional[str]
     current_time: float
+    # local_obs_dim: int
+    # global_state_dim: int
     action_dim: int
     drop_action: int
     has_reset: bool
 
+    # 把str类型的agent id映射成数字
     agent_name_mapping: Mapping[str, int]
 
+    # 正常停止与异常停止标记，但我其实没实现异常停止 ·_·
     terminations: Mapping[str, bool]
     truncations: Mapping[str, bool]
 
+    # def observe(self, agent: str) -> Dict[str, np.ndarray]:
+    #     ...
+    # def state(self) -> np.ndarray:
+    #     ...
     def step(self, action: Optional[int]) -> None: ...
 
     def pop_last_routing_action_facts(
@@ -2379,8 +483,10 @@ class DecisionSnapshot:
 
     global_state: FloatArray
 
+    # 等于None表示由actor给工作，等于-1表示动作是丢弃
     forced_action: Optional[int] = None
 
+    # 转化成字典方便打印和传递
     def as_dict(self) -> Dict[str, Any]:
         return {
             "agent_id": self.agent_id,
@@ -2416,18 +522,34 @@ class RoutingActionResult:
 
     job_id: str
 
+    # 真正做 Routing decision 的时间。
     decision_time: float
 
+    # env.step() 完成后的环境时间。
     result_time: float
 
     action: int
     action_type: str
     action_source: str
 
+    # 当前 Routing action 当时立即产生的 reward。
     immediate_reward: float
 
+    # Self:
+    #     当前 DC
+    #
+    # Edge:
+    #     目标 Edge DC
+    #
+    # Cloud:
+    #     cloud
+    #
+    # Drop:
+    #     None
     target_dc_id: Optional[str]
 
+    # 当前 Job 是否已经在本次调用中完成 Finalize。
+    # 目前主要对应 forced drop。
     job_finalized: bool
 
     def as_dict(
@@ -2457,13 +579,9 @@ class TransitionCollector:
         routing_state_builder: RoutingCentralizedStateBuilder,
         pending_trace_store: PendingJobTraceStore,
         training_reward_model: HMasacTrainingRewardModel,
-        short_window_runtime=None,
-        state_heuristic=None,
     ) -> None:
 
         self.env = env
-        self.short_window_runtime = short_window_runtime
-        self.state_heuristic = state_heuristic
 
         self.routing_observation_builder = routing_observation_builder
 
@@ -2471,15 +589,21 @@ class TransitionCollector:
 
         self.pending_trace_store = pending_trace_store
         self.training_reward_model = training_reward_model
+        # ==========================================================
+        # Collector 现在统计的是实际执行的 Routing actions，
+        # 不再统计“生成了多少条 Replay Transition”。
+        # ==========================================================
 
         self.total_routing_action_count = 0
         self.episode_routing_action_count = 0
 
         self._validate_environment_interface()
 
+    # 重置计数器
     def reset_episode(self) -> None:
         self.episode_routing_action_count = 0
 
+    # 获取当前环境所对应的决策状态快照
     def _build_current_decision_snapshot(
         self,
     ) -> DecisionSnapshot:
@@ -2501,32 +625,50 @@ class TransitionCollector:
             Host 层不会调用本函数。
         """
 
+        # ==========================================================
+        # 1. 基础环境状态检查
+        # ==========================================================
+
         self._require_reset()
 
+        # 当前必须存在真正活跃的 PettingZoo Routing Agent。
+        # Host phase 下 agent_selection=None，因此不能进入这里。
         agent_id = self._get_live_selected_agent()
 
         if self.env.current_job_id is None:
             raise RuntimeError(
-                "构造 Routing DecisionSnapshot 时 "
-                "current_job_id 为 None："
-                f"agent={agent_id}"
+                "构造 Routing DecisionSnapshot 时 " "current_job_id 为 None：" f"agent={agent_id}"
             )
 
         job_id = str(self.env.current_job_id)
-        if self.short_window_runtime is not None:
-            self.short_window_runtime.record_arrival(
-                agent_id, job_id, float(self.env.current_time)
-            )
+
+        # ==========================================================
+        # 2. Routing Actor Local Observation
+        #
+        # 这里只构造 Routing 层 Observation。
+        # Host Observation 由 HostObservationBuilder 单独负责。
+        # ==========================================================
 
         local_obs = np.asarray(
             self.routing_observation_builder.build(agent_id),
             dtype=np.float32,
         ).copy()
 
+        # ==========================================================
+        # 3. Routing Centralized Critic State
+        #
+        # 该 State 只用于 CTDE 训练阶段的 Routing Critic。
+        # Routing Actor 执行阶段仍然只使用 local_obs。
+        # ==========================================================
+
         global_state = np.asarray(
             self.routing_state_builder.build(),
             dtype=np.float32,
         ).copy()
+
+        # ==========================================================
+        # 4. 构造当前 Routing DecisionSnapshot
+        # ==========================================================
 
         snapshot = DecisionSnapshot(
             agent_id=agent_id,
@@ -2538,14 +680,32 @@ class TransitionCollector:
             forced_action=(self._get_forced_action(job_id)),
         )
 
-        score = (
-            self.state_heuristic.capture(self.env, snapshot)
-            if self.state_heuristic is not None
-            else 0.0
-        )
+        # ==========================================================
+        # 5. Pending Job Causal Trace：
+        #    回填上一跳 Edge -> Edge Routing 的真实 successor
+        #
+        # 例如：
+        #
+        #   Job42 @ DC1
+        #       ↓ action = DC3
+        #
+        # 前一跳只记录：
+        #
+        #   state      = obs(Job42 @ DC1)
+        #   action     = DC3
+        #   next_state = UNKNOWN
+        #
+        # 当 Job42 真正到达 DC3，并进入本函数时，
+        # 当前 snapshot 就是上一跳真正的 same-job successor：
+        #
+        #   next_state = obs(Job42 @ DC3)
+        #
+        # 如果当前 Job 没有未解析的 Edge predecessor，
+        # resolve_routing_successor() 返回 False，
+        # 不执行任何修改。
+        # ==========================================================
+
         self.pending_trace_store.resolve_routing_successor(
-            next_heuristic_score=score,
-            heuristic_valid=self.state_heuristic is not None,
             job_id=snapshot.job_id,
             next_agent_id=(snapshot.agent_id),
             next_agent_index=(snapshot.agent_index),
@@ -2554,11 +714,17 @@ class TransitionCollector:
             next_global_state=(snapshot.global_state),
         )
 
+        # ==========================================================
+        # 6. 返回当前 Routing Decision
+        # ==========================================================
+
         return snapshot
 
     def capture_decision(self) -> DecisionSnapshot:
         self._require_reset()
         return self._build_current_decision_snapshot()
+
+    # 这里相当于把原来的 capture_decision() 拆成 _build_current_decision_snapshot()->capture_decision(),这样后面 execute_and_collect() 也可以调用同一个函数
 
     def _validate_decision_is_current(
         self,
@@ -2581,7 +747,18 @@ class TransitionCollector:
             不负责构造 Observation 或执行 action。
         """
 
+        # ==========================================================
+        # 1. 当前必须仍然存在真正活跃的 Routing Agent。
+        #
+        # Host phase 下 agent_selection=None，
+        # _get_live_selected_agent() 会直接拒绝。
+        # ==========================================================
+
         current_agent_id = self._get_live_selected_agent()
+
+        # ==========================================================
+        # 2. Agent 必须与 Snapshot 一致。
+        # ==========================================================
 
         if current_agent_id != str(decision.agent_id):
             raise RuntimeError(
@@ -2590,6 +767,10 @@ class TransitionCollector:
                 f"current_agent={current_agent_id}, "
                 f"job={decision.job_id}"
             )
+
+        # ==========================================================
+        # 3. 当前必须仍然存在 Routing Job。
+        # ==========================================================
 
         if self.env.current_job_id is None:
             raise RuntimeError(
@@ -2600,6 +781,13 @@ class TransitionCollector:
             )
 
         current_job_id = str(self.env.current_job_id)
+
+        # ==========================================================
+        # 4. Job 必须与 Snapshot 一致。
+        #
+        # 如果不同，说明 Environment 已经推进到另一个 Job，
+        # 不能再用旧 Observation 执行动作。
+        # ==========================================================
 
         if current_job_id != str(decision.job_id):
             raise RuntimeError(
@@ -2660,6 +848,10 @@ class TransitionCollector:
         因而绝不在本函数中被当作当前 Job 的 Replay next_state。
         """
 
+        # ==========================================================
+        # 1. 基础检查
+        # ==========================================================
+
         self._require_reset()
 
         self._validate_decision_is_current(decision)
@@ -2674,9 +866,17 @@ class TransitionCollector:
             "policy",
             "orchestrator",
         }:
-            raise ValueError(
-                "TransitionCollector 收到未知 action_source：" f"{action_source}"
-            )
+            raise ValueError("TransitionCollector 收到未知 action_source：" f"{action_source}")
+
+        # ==========================================================
+        # 2. Forced action 一致性检查
+        #
+        # 如果 DecisionSnapshot 已经明确告诉 Trainer：
+        #
+        #     forced_action = DROP_ACTION
+        #
+        # Trainer 就不能继续走 random / policy。
+        # ==========================================================
 
         if decision.forced_action is not None:
 
@@ -2706,6 +906,10 @@ class TransitionCollector:
                 f"action={action}"
             )
 
+        # ==========================================================
+        # 3. 使用 Environment 唯一 action semantics 解码。
+        # ==========================================================
+
         (
             action_type,
             target_dc_id,
@@ -2714,15 +918,48 @@ class TransitionCollector:
             action=action,
         )
 
+        # ==========================================================
+        # 4. 执行真正的 PettingZoo Routing action。
+        #
+        # Host action 永远不会进入本函数。
+        # ==========================================================
+
         self.env.step(action)
+
+        # ==============================================================
+        # 5. 从 Environment 获取真实 Routing Action Facts。
+        #
+        # Environment 不再提供 MR-H-MASAC training reward。
+        # ==============================================================
 
         routing_action_facts = self.env.pop_last_routing_action_facts()
 
+        # ==========================================================
+        # 6. 保存本次 Routing action 的即时 reward。
+        #
+        # 必须按动作执行前的 decision.agent_id 获取，
+        # 因为 env.step() 后当前 Agent / Job 都可能变化。
+        # ==========================================================
+
         immediate_reward = float(
-            self.training_reward_model.calculate_routing_immediate_reward(
-                routing_action_facts
-            )
+            self.training_reward_model.calculate_routing_immediate_reward(routing_action_facts)
         )
+
+        # ==========================================================
+        # 7. 写入 Pending Job Causal Trace。
+        #
+        # 这里只记录事实：
+        #
+        #     state
+        #     action
+        #     source / target
+        #     immediate_reward
+        #
+        # Edge action 的 same-job next_state 仍然未知。
+        # 后续真正到达目标 DC 时，
+        # _build_current_decision_snapshot()
+        # 会负责 resolve。
+        # ==========================================================
 
         self.pending_trace_store.record_routing_step(
             job_id=(decision.job_id),
@@ -2738,6 +975,18 @@ class TransitionCollector:
             target_dc_id=(target_dc_id),
         )
 
+        # ==========================================================
+        # 8. Forced Drop：
+        #
+        # Drop penalty 已经保存在当前 Routing Step 的
+        # immediate_reward 中。
+        #
+        # 因此：
+        #   - 不额外创建 RewardEvent；
+        #   - 只 mark terminal；
+        #   - 然后立即 Finalize。
+        # ==========================================================
+
         if action_type == "drop":
             self.pending_trace_store.mark_terminal(
                 job_id=(decision.job_id),
@@ -2747,14 +996,19 @@ class TransitionCollector:
 
             self.pending_trace_store.finalize_terminal_trace(job_id=(decision.job_id))
 
-        if self.short_window_runtime is not None:
-            self.short_window_runtime.record_routing(
-                decision,
-                action_type,
-                target_dc_id,
-                action_source,
-                self.env.job_map[decision.job_id],
-            )
+        # ==========================================================
+        # 9. 创建 Trainer 环境时间线上的下一 Routing Decision。
+        #
+        # 重要：
+        #
+        #     next_decision
+        #
+        # 不是当前 Job 的 Replay next_state。
+        #
+        # 如果它恰好是当前 Job 的真实 Edge successor，
+        # _build_current_decision_snapshot() 会通过 job_id
+        # 正确 resolve 前一跳。
+        # ==========================================================
 
         environment_done = self._is_episode_done()
 
@@ -2762,6 +1016,18 @@ class TransitionCollector:
 
         if not environment_done and self.env.agent_selection is not None:
             next_decision = self._build_current_decision_snapshot()
+
+        # ==========================================================
+        # 10. 只返回即时执行结果。
+        #
+        # 不返回：
+        #     next_state
+        #     done
+        #     terminated
+        #     truncated
+        #
+        # 这些属于 Job Finalize 后的 RoutingTransition。
+        # ==========================================================
 
         routing_result = RoutingActionResult(
             agent_id=str(decision.agent_id),
@@ -2774,10 +1040,12 @@ class TransitionCollector:
             action_source=(action_source),
             immediate_reward=(immediate_reward),
             target_dc_id=(target_dc_id),
-            job_finalized=(
-                self.pending_trace_store.has_finalized_trace(decision.job_id)
-            ),
+            job_finalized=(self.pending_trace_store.has_finalized_trace(decision.job_id)),
         )
+
+        # ==========================================================
+        # 11. Collector 计数。
+        # ==========================================================
 
         self.total_routing_action_count += 1
         self.episode_routing_action_count += 1
@@ -2787,6 +1055,7 @@ class TransitionCollector:
             next_decision,
         )
 
+    # 按 PettingZoo AEC 约定清理一个已经终止的智能体
     def drain_one_dead_agent(
         self,
     ) -> bool:
@@ -2825,6 +1094,7 @@ class TransitionCollector:
 
         return True
 
+    # 清理 episode 结束后的全部 dead agent，返回清理次数
     def drain_all_dead_agents(self) -> int:
         count = 0
         while self.env.agents:
@@ -2833,13 +1103,19 @@ class TransitionCollector:
             count += 1
         return count
 
+    ############################## 辅助函数 ############################################
+
+    # 构造阶段检查环境是否提供采集器需要的接口
     def _validate_environment_interface(self) -> None:
         required_attributes = (
             "possible_agents",
             "agents",
             "agent_selection",
+            # "current_agent_id",
             "current_job_id",
             "current_time",
+            # "local_obs_dim",
+            # "global_state_dim",
             "action_dim",
             "drop_action",
             "has_reset",
@@ -2853,6 +1129,7 @@ class TransitionCollector:
             if not hasattr(self.env, name):
                 raise AttributeError(f"环境缺少 TransitionCollector 所需属性：{name}。")
 
+        # observe、state 和 step 不仅要存在，还必须可以调用。
         for method_name in (
             "step",
             "_decode_action",
@@ -2866,9 +1143,7 @@ class TransitionCollector:
 
             if not callable(method):
                 raise AttributeError(
-                    "Environment 缺少 TransitionCollector "
-                    "所需可调用方法："
-                    f"{method_name}()"
+                    "Environment 缺少 TransitionCollector " "所需可调用方法：" f"{method_name}()"
                 )
 
         if int(self.env.action_dim) <= 0:
@@ -2879,10 +1154,12 @@ class TransitionCollector:
         if int(self.routing_state_builder.state_dim) <= 0:
             raise ValueError("routing_global_state_dim " "必须大于 0。")
 
+    # 所有采集动作都要求环境先完成reset
     def _require_reset(self) -> None:
         if not bool(self.env.has_reset):
             raise RuntimeError("环境尚未 reset，不能采集 Transition。")
 
+    # 返回活着的、当前决策的agent
     def _get_live_selected_agent(
         self,
     ) -> str:
@@ -2922,6 +1199,7 @@ class TransitionCollector:
 
         return agent_id
 
+    # 判断整个 episode 结束
     def _is_episode_done(self) -> bool:
         if len(self.env.possible_agents) == 0:
             return True
@@ -2933,6 +1211,7 @@ class TransitionCollector:
             for agent_id in self.env.possible_agents
         )
 
+    # 返回当前决策动作
     def _get_forced_action(self, job_id: str) -> Optional[int]:
         should_drop_fn = getattr(self.env, "_should_drop_arrival_job", None)
         if bool(should_drop_fn(job_id)):
@@ -2966,9 +1245,7 @@ class TransitionCollector:
         )
 
         if not callable(decode_action):
-            raise AttributeError(
-                "TransitionCollector 需要 Environment 提供 " "_decode_action()。"
-            )
+            raise AttributeError("TransitionCollector 需要 Environment 提供 " "_decode_action()。")
 
         decoded_action = decode_action(
             agent_id=str(agent_id),
@@ -3008,120 +1285,14 @@ class TransitionCollector:
         )
 
 
-class StateScoreLog:
-    def __init__(self, path):
-        self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.file = self.path.open("x", encoding="utf-8")
-        self.episode = 0
-
-    def record(self, decision, score, rows, settings):
-        self.file.write(
-            json.dumps(
-                {
-                    "episode": self.episode,
-                    "time": decision.env_time,
-                    "job_id": decision.job_id,
-                    "agent_id": decision.agent_id,
-                    "score": score,
-                    "score_version": settings.heuristic_version,
-                    "candidates": [asdict(row) for row in rows],
-                },
-                ensure_ascii=False,
-                allow_nan=False,
-            )
-            + "\n"
-        )
-
-    def flush(self):
-        self.file.flush()
-        os.fsync(self.file.fileno())
-
-    def close(self):
-        self.file.close()
-
-
-class RoutingStateHeuristic:
-    """Capture-time state quality from uncentered confidence-adjusted utility."""
-
-    def __init__(self, runtime, feedback, settings, targets, log=None):
-        validate_bcgh_feature_config(settings)
-        self.runtime, self.feedback, self.settings = runtime, feedback, settings
-        self.action_target_dc_ids = tuple(targets)
-        self.log = log
-
-    def build_action_context(
-        self,
-        source_dc_id,
-        historical_feedback_provider=None,
-        *,
-        cpu_request=0.0,
-        gpu_request=0.0,
-        source_signals=None,
-    ):
-        context = {}
-        for target in self.action_target_dc_ids:
-            feedback = None
-            if target != source_dc_id and historical_feedback_provider is not None:
-                feedback = historical_feedback_provider.get_feedback(
-                    source_dc_id, target
-                )
-            success = 0.5 if feedback is None else feedback.get("success_ewma", 0.5)
-            sla = 0.5 if feedback is None else feedback.get("sla_success_ewma", 0.5)
-            delay = (
-                0.5
-                if feedback is None
-                else 1 - feedback.get("completion_time_ewma", 0.5)
-            )
-            context[target] = RoutingActionFeatures(
-                target,
-                float(np.clip(success, 0, 1)),
-                float(np.clip(sla, 0, 1)),
-                float(np.clip(delay, 0, 1)),
-                cpu_request,
-                gpu_request,
-                (source_signals or {}).get(target, LocalSourceSignal()),
-            )
-        return context
-
-    def capture(self, env, decision):
-        if (
-            not self.settings.enable_heuristic_guidance
-            or decision.forced_action is not None
-        ):
-            return 0.0
-        context = self.runtime.build_action_context(self, env, decision, self.feedback)
-        rows = self.runtime.game.evaluate_actions(decision.agent_id, context)
-        score = state_score_from_utilities(rows, self.settings)
-        if self.log is not None:
-            self.log.record(decision, score, rows, self.settings)
-        return score
-
-
-def state_score_from_utilities(rows, settings):
-    feasible = [row for row in rows if row.feasible]
-    if not feasible:
-        raise ValueError("No reference candidate for routing state score")
-    values = [row.guidance_utility for row in feasible]
-    if not all(math.isfinite(value) for value in values):
-        raise ValueError("Non-finite candidate utility")
-    positive(settings.heuristic_scale, "heuristic_scale", zero=True)
-    if not math.isfinite(settings.heuristic_neutral_utility):
-        raise ValueError("heuristic_neutral_utility must be finite")
-    return (
-        settings.heuristic_scale
-        * sum(math.tanh(value - settings.heuristic_neutral_utility) for value in values)
-        / len(values)
-    )
-
-
+# Training configuration and support
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-BCGH_MASAC_DIR = Path(__file__).resolve().parent
+MR_H_MASAC_DIR = Path(__file__).resolve().parent
 
 CHECKPOINT_SCHEMA_VERSION = 2
 
-CHECKPOINT_ARCHITECTURE = "bcgh2_masac_two_layer_routing_host_v1"
+CHECKPOINT_ARCHITECTURE = "mr_h_masac_independent_routing_host_v1"
 
 TERMINAL_FAILURE_REASONS = frozenset(
     {
@@ -3145,10 +1316,6 @@ UPDATE_TENSOR_METRIC_NAMES = (
     "alpha",
     "policy_entropy",
     "target_entropy",
-    "heuristic_reward_mean",
-    "modified_reward_mean",
-    "raw_reward_mean",
-    "effective_gamma",
 )
 
 ENVIRONMENT_DIR = PROJECT_ROOT / "environment"
@@ -3159,7 +1326,9 @@ class TrainConfig:
 
     num_episodes: int = conf.Episodes
 
-    routing_replay_capacity: int = conf.ROUTING_REPLAY_CAPACITY
+    # System-wide budget; optional per-DC override explicitly increases total capacity.
+    routing_replay_capacity: int = conf.MR_H_MASAC_ROUTING_REPLAY_TOTAL_CAPACITY
+    routing_replay_capacity_per_dc: Optional[int] = conf.MR_H_MASAC_ROUTING_REPLAY_CAPACITY_PER_DC
     host_replay_capacity: int = conf.HOST_REPLAY_CAPACITY
     routing_batch_size: int = conf.ROUTING_BATCH_SIZE
     routing_random_warmup_steps: int = conf.ROUTING_RANDOM_WARMUP_STEPS
@@ -3173,196 +1342,26 @@ class TrainConfig:
     host_train_every: int = conf.HOST_TRAIN_EVERY
     host_updates_per_train: int = conf.HOST_UPDATES_PER_TRAIN
 
+    # Three-stage training
     host_pretrain_episodes: int = conf.HOST_PRETRAIN_EPISODES
     routing_train_episodes: int = conf.ROUTING_TRAIN_EPISODES
     joint_finetune_episodes: int = conf.JOINT_FINETUNE_EPISODES
     log_interval: int = conf.Log_interval
-    checkpoint_interval: int = (
-        conf.Checkpoint_Interval
-    )  # 兼容旧调用，双层训练不按间隔保存
+    checkpoint_interval: int = conf.Checkpoint_Interval  # 兼容旧调用，双层训练不按间隔保存
     seed: int = conf.Seed
-
-    checkpoint_dir: str = "model/BCGH2-MASAC/checkpoints"
-    episode_log_csv_path: str = "result/BCGH2-MASAC/episode_log.csv"
-    dc_log_csv_path: str = "result/BCGH2-MASAC/dc_log.csv"
+    checkpoint_dir: str = conf.MR_H_MASAC_CHECKPOINT_DIR
+    episode_log_csv_path: str = conf.MR_H_MASAC_EPISODE_LOG_CSV_PATH
+    dc_log_csv_path: str = conf.MR_H_MASAC_DC_LOG_CSV_PATH
     old_env_path: Optional[str] = conf.Old_Env_Path
-    resume_checkpoint: Optional[str] = None
-    routing_init_checkpoint: Optional[str] = None
-
+    resume_checkpoint: Optional[str] = conf.MR_H_MASAC_RESUME_CHECKPOINT
     vary_episode_seed: bool = conf.Vary_Episode_Seed
-    collect_neighbor_historical_feedback: bool = (
-        conf.COLLECT_NEIGHBOR_HISTORICAL_FEEDBACK
-    )
+    collect_neighbor_historical_feedback: bool = conf.COLLECT_NEIGHBOR_HISTORICAL_FEEDBACK
     use_neighbor_historical_feedback: bool = conf.USE_NEIGHBOR_HISTORICAL_FEEDBACK
     neighbor_feedback_ewma_alpha: float = conf.NEIGHBOR_FEEDBACK_EWMA_ALPHA
-    neighbor_feedback_age_scale_samples: float = (
-        conf.NEIGHBOR_FEEDBACK_AGE_SCALE_SAMPLES
-    )
+    neighbor_feedback_age_scale_samples: float = conf.NEIGHBOR_FEEDBACK_AGE_SCALE_SAMPLES
     neighbor_feedback_confidence_scale_samples: float = (
         conf.NEIGHBOR_FEEDBACK_CONFIDENCE_SCALE_SAMPLES
     )
-    enable_bayesian_game: bool = True
-    enable_heuristic_guidance: bool = True
-    enable_reward_shaping: bool = True
-    enable_discount_reduction: bool = True
-    heuristic_beta: float = 0.98
-    heuristic_scale: float = 1.0
-    heuristic_neutral_utility: float = 0.5
-    heuristic_reference_distribution: str = "uniform_static_feasible"
-    heuristic_version: int = 1
-    bayesian_prior_alpha: float = conf.BCGH_BAYESIAN_PRIOR_ALPHA
-    bayesian_prior_beta: float = conf.BCGH_BAYESIAN_PRIOR_BETA
-    bayesian_confidence_scale: float = conf.BCGH_BAYESIAN_CONFIDENCE_SCALE
-    short_window_s: float = conf.BCGH_SHORT_WINDOW_S
-    source_evidence_weight: float = conf.BCGH_SOURCE_EVIDENCE_WEIGHT
-    source_volume_scale: float = conf.BCGH_SOURCE_VOLUME_SCALE
-    source_confidence_scale: float = conf.BCGH_SOURCE_CONFIDENCE_SCALE
-    resource_cpu_weight: float = conf.BCGH_RESOURCE_CPU_WEIGHT
-    resource_gpu_weight: float = conf.BCGH_RESOURCE_GPU_WEIGHT
-    resource_cost_scale: float = conf.BCGH_RESOURCE_COST_SCALE
-    absorption_enabled: bool = conf.BCGH_ABSORPTION_ENABLED
-    absorption_prior_self: float = conf.BCGH_ABSORPTION_PRIOR_SELF
-    absorption_prior_edge: float = conf.BCGH_ABSORPTION_PRIOR_EDGE
-    absorption_prior_cloud: float = conf.BCGH_ABSORPTION_PRIOR_CLOUD
-    absorption_prior_drop: float = conf.BCGH_ABSORPTION_PRIOR_DROP
-    absorption_confidence_scale: float = conf.BCGH_ABSORPTION_CONFIDENCE_SCALE
-    absorption_edge_weight: float = conf.BCGH_ABSORPTION_EDGE_WEIGHT
-    absorption_cloud_weight: float = conf.BCGH_ABSORPTION_CLOUD_WEIGHT
-    absorption_drop_weight: float = conf.BCGH_ABSORPTION_DROP_WEIGHT
-    absorption_demand_thresholds: tuple = conf.BCGH_ABSORPTION_DEMAND_THRESHOLDS
-    absorption_class_confidence_scale: float = (
-        conf.BCGH_ABSORPTION_CLASS_CONFIDENCE_SCALE
-    )
-    absorption_policy_actions_only: bool = conf.BCGH_ABSORPTION_POLICY_ACTIONS_ONLY
-    pressure_linear_cost_weight: float = conf.BCGH_PRESSURE_LINEAR_WEIGHT
-    pressure_quadratic_cost_weight: float = conf.BCGH_PRESSURE_QUADRATIC_WEIGHT
-    benefit_success_weight: float = conf.BCGH_BENEFIT_SUCCESS_WEIGHT
-    benefit_sla_weight: float = conf.BCGH_BENEFIT_SLA_WEIGHT
-    benefit_delay_weight: float = conf.BCGH_BENEFIT_DELAY_WEIGHT
-    risk_congestion_cost_weight: float = conf.BCGH_RISK_CONGESTION_COST_WEIGHT
-
-
-def bcgh_guidance_metadata(train_config):
-    """Runtime semantics are part of the checkpoint even when tensor shapes match."""
-    names = (
-        "enable_bayesian_game",
-        "enable_heuristic_guidance",
-        "enable_reward_shaping",
-        "enable_discount_reduction",
-        "heuristic_beta",
-        "heuristic_scale",
-        "heuristic_neutral_utility",
-        "heuristic_reference_distribution",
-        "heuristic_version",
-        "short_window_s",
-        "bayesian_prior_alpha",
-        "bayesian_prior_beta",
-        "bayesian_confidence_scale",
-        "source_evidence_weight",
-        "source_volume_scale",
-        "source_confidence_scale",
-        "resource_cpu_weight",
-        "resource_gpu_weight",
-        "resource_cost_scale",
-        "absorption_enabled",
-        "absorption_prior_self",
-        "absorption_prior_edge",
-        "absorption_prior_cloud",
-        "absorption_prior_drop",
-        "absorption_confidence_scale",
-        "absorption_edge_weight",
-        "absorption_cloud_weight",
-        "absorption_drop_weight",
-        "absorption_demand_thresholds",
-        "absorption_class_confidence_scale",
-        "absorption_policy_actions_only",
-        "pressure_linear_cost_weight",
-        "pressure_quadratic_cost_weight",
-        "benefit_success_weight",
-        "benefit_sla_weight",
-        "benefit_delay_weight",
-        "risk_congestion_cost_weight",
-        "collect_neighbor_historical_feedback",
-        "use_neighbor_historical_feedback",
-    )
-    parameters = {}
-    for name in names:
-        value = getattr(train_config, name)
-        parameters[name] = list(value) if isinstance(value, tuple) else value
-    return {
-        "version": 1,
-        "scheduler": "BCGH2-MASAC",
-        "method": "same_job_next_state_reward_discount_reformulation",
-        "data_augmentation": False,
-        "actor_logit_bias": False,
-        "clock": "episode_simulation_seconds",
-        "source_semantics": "local_queue_direct_previous_hop_bounded_soft_evidence",
-        "pressure_semantics": "executed_edge_transfer_cpu_gpu_marginal_cost",
-        "absorption_semantics": "directed_edge_successor_self_edge_cloud_drop",
-        "parameters": parameters,
-    }
-
-
-def is_bcgh_zero_diff_mode(
-    train_config: TrainConfig,
-) -> bool:
-    """
-    判断贝叶斯运行状态与后继状态引导是否都关闭。
-
-    Zero-Diff Mode：
-        Bayesian Game        = False
-        Heuristic Guidance   = False
-    """
-
-    return not bool(train_config.enable_bayesian_game) and not bool(
-        train_config.enable_heuristic_guidance
-    )
-
-
-def get_bcgh_runtime_mode(
-    train_config: TrainConfig,
-) -> str:
-    """
-    返回当前 BCGH2-MASAC 的实验模式名称。
-
-    历史反馈输入由独立配置控制，因此关闭这两个功能不意味着
-    与所有其他调度器的观测完全相同。
-    """
-
-    bayesian_enabled = bool(train_config.enable_bayesian_game)
-
-    heuristic_enabled = bool(train_config.enable_heuristic_guidance)
-
-    if not bayesian_enabled and not heuristic_enabled:
-        return "SAC-without-Bayesian-guidance"
-
-    if bayesian_enabled and not heuristic_enabled:
-        return "Bayesian-only"
-
-    if not bayesian_enabled and heuristic_enabled:
-        return "Invalid-guidance-without-Bayesian-runtime"
-
-    return "Bayesian+NextStateRewardDiscount"
-
-
-def validate_bcgh_feature_config(train_config):
-    if train_config.enable_heuristic_guidance and not train_config.enable_bayesian_game:
-        raise ValueError("BCGH2 state guidance requires Bayesian runtime")
-    if (
-        not math.isfinite(train_config.heuristic_beta)
-        or not 0 <= train_config.heuristic_beta <= 1
-    ):
-        raise ValueError("heuristic_beta must be in [0, 1]")
-    positive(train_config.heuristic_scale, "heuristic_scale", zero=True)
-    if not math.isfinite(train_config.heuristic_neutral_utility):
-        raise ValueError("heuristic_neutral_utility must be finite")
-    if (
-        train_config.heuristic_reference_distribution != "uniform_static_feasible"
-        or train_config.heuristic_version != 1
-    ):
-        raise ValueError("Unsupported heuristic definition")
-    if train_config.resume_checkpoint and train_config.routing_init_checkpoint:
-        raise ValueError("Resume and weight initialization are mutually exclusive")
 
 
 class TrainingStage(
@@ -3381,9 +1380,11 @@ class EpisodeStatistics:
     episode_seed: int
     training_stage: str
 
+    # System / Routing Reward Bookkeeping
     per_agent_returns: Dict[str, float]
     episode_return: float = 0.0
 
+    # Routing Behavior
     routing_decision_count: int = 0
     routing_forced_action_count: int = 0
     routing_orchestrator_action_count: int = 0
@@ -3394,6 +1395,7 @@ class EpisodeStatistics:
     routing_cloud_count: int = 0
     routing_drop_count: int = 0
 
+    # Host Behavior
     host_decision_count: int = 0
     host_random_action_count: int = 0
     host_policy_action_count: int = 0
@@ -3401,9 +1403,11 @@ class EpisodeStatistics:
     host_queued_count: int = 0
     host_dropped_count: int = 0
 
+    # Gradient Update Counts
     routing_update_count: int = 0
     host_update_count: int = 0
 
+    # Routing Update Metrics
     routing_update_metric_sums: Dict[
         str,
         float,
@@ -3413,6 +1417,7 @@ class EpisodeStatistics:
         int,
     ] = field(default_factory=dict)
 
+    # Host Update Metrics：全系统聚合
     host_update_metric_sums: Dict[
         str,
         float,
@@ -3422,6 +1427,7 @@ class EpisodeStatistics:
         int,
     ] = field(default_factory=dict)
 
+    # Host Update Metrics：逐 DC
     host_update_metric_sums_by_dc: Dict[
         str,
         Dict[str, float],
@@ -3430,46 +1436,32 @@ class EpisodeStatistics:
         str,
         Dict[str, int],
     ] = field(default_factory=dict)
+    routing_metric_sums_by_dc: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    routing_metric_counts_by_dc: Dict[str, Dict[str, int]] = field(default_factory=dict)
     pending_routing_update_infos: list = field(default_factory=list)
     pending_host_update_infos: list = field(default_factory=list)
 
+    # Per-DC Counters
     dc_counters: Dict[
         str,
         Dict[str, int],
     ] = field(default_factory=dict)
 
+    # Routing Source -> Target Matrix
     routing_source_target_counts: Dict[
         str,
         Dict[str, int],
     ] = field(default_factory=dict)
 
+    # Finalized Causal Trace Statistics
     terminal_trace_flushed_count: int = 0
     routing_transition_flushed_count: int = 0
     host_transition_flushed_count: int = 0
     routing_edge_hop_total: int = 0
     multi_hop_job_count: int = 0
     max_routing_hops: int = 0
-    routing_edge_hops_by_job: list = field(default_factory=list)
-    edge_successor_total: int = 0
-    edge_successor_self_count: int = 0
-    edge_successor_edge_count: int = 0
-    edge_successor_cloud_count: int = 0
-    edge_successor_drop_count: int = 0
-    first_edge_successor_total: int = 0
-    first_edge_absorbed_count: int = 0
-    absorption_pair_counts: Dict[str, Dict[str, int]] = field(default_factory=dict)
     routing_layer_reward_sum: float = 0.0
     host_layer_reward_sum: float = 0.0
-
-    bayesian_game_enabled: bool = True
-    heuristic_beta: float = 1.0
-    routing_gamma: float = 0.99
-    reward_shaping_enabled: bool = False
-    discount_reduction_enabled: bool = False
-    heuristic_reward_sum: float = 0.0
-    heuristic_score_sum: float = 0.0
-    heuristic_nonterminal_count: int = 0
-    heuristic_valid_score_count: int = 0
 
     def _inc_dc(
         self,
@@ -3518,6 +1510,7 @@ class EpisodeStatistics:
             + 1
         )
 
+    # Routing Decision Statistics
     def record_routing_decision(
         self,
         agent_id: str,
@@ -3532,6 +1525,7 @@ class EpisodeStatistics:
         reward = float(reward)
         target_dc_id = None if target_dc_id is None else str(target_dc_id)
 
+        # System reward bookkeeping
         self.episode_return += reward
         self.per_agent_returns[agent_id] = float(
             self.per_agent_returns.get(
@@ -3541,6 +1535,7 @@ class EpisodeStatistics:
             + reward
         )
 
+        # Routing decision source
         self.routing_decision_count += 1
         self._inc_dc(
             agent_id,
@@ -3558,6 +1553,7 @@ class EpisodeStatistics:
         else:
             raise ValueError("未知 Routing action_source：" f"{action_source}")
 
+        # Routing action semantics
         if action_type == "self":
             self.routing_self_count += 1
             self._inc_dc(
@@ -3591,6 +1587,7 @@ class EpisodeStatistics:
         else:
             raise ValueError("未知 Routing action_type：" f"{action_type}")
 
+        # Source -> Target Matrix
         target_key = str(target_dc_id) if target_dc_id is not None else "__drop__"
         source_targets = self.routing_source_target_counts.setdefault(
             agent_id,
@@ -3604,6 +1601,10 @@ class EpisodeStatistics:
             )
             + 1
         )
+
+    # ==========================================================
+    # Host Decision Statistics
+    # ==============================================================
 
     def record_host_decision(
         self,
@@ -3683,6 +1684,10 @@ class EpisodeStatistics:
         else:
             raise ValueError("未知 Host execution_result：" f"{execution_result}")
 
+    # ==========================================================
+    # Delayed Reward
+    # ==============================================================
+
     def record_delayed_training_reward(
         self,
         agent_id: str,
@@ -3703,21 +1708,27 @@ class EpisodeStatistics:
             + reward_delta
         )
 
-    def record_routing_update(
-        self,
-        update_info: Dict[str, float],
-    ) -> None:
+    # ==========================================================
+    # Routing Update Metrics
+    # ==============================================================
 
+    def record_routing_update(self, update_info, dc_id, sample_count=1):
         self.routing_update_count += 1
+        self._inc_dc(dc_id, 'routing_updates')
+        dc_sums = self.routing_metric_sums_by_dc.setdefault(dc_id, {})
+        dc_counts = self.routing_metric_counts_by_dc.setdefault(dc_id, {})
+        for name, value in update_info.items():
+            value = float(value)
+            if not np.isfinite(value):
+                continue
+            for sums, counts in ((self.routing_update_metric_sums, self.routing_update_metric_counts),
+                                 (dc_sums, dc_counts)):
+                sums[name] = sums.get(name, 0.0) + value * sample_count
+                counts[name] = counts.get(name, 0) + sample_count
 
-        for metric_name, metric_value in update_info.items():
-
-            self._accumulate_metric(
-                sums=(self.routing_update_metric_sums),
-                counts=(self.routing_update_metric_counts),
-                metric_name=(metric_name),
-                metric_value=float(metric_value),
-            )
+    def mean_dc_routing_metric(self, dc_id, name):
+        count = self.routing_metric_counts_by_dc.get(dc_id, {}).get(name, 0)
+        return (self.routing_metric_sums_by_dc[dc_id][name] / count) if count else float('nan')
 
     def record_host_update(
         self,
@@ -3748,6 +1759,7 @@ class EpisodeStatistics:
 
             metric_value = float(metric_value)
 
+            # 所有 Host SAC 的整体加权平均。
             self._accumulate_metric(
                 sums=(self.host_update_metric_sums),
                 counts=(self.host_update_metric_counts),
@@ -3755,12 +1767,17 @@ class EpisodeStatistics:
                 metric_value=(metric_value),
             )
 
+            # 当前 DC 自己的平均。
             self._accumulate_metric(
                 sums=dc_sums,
                 counts=dc_counts,
                 metric_name=(metric_name),
                 metric_value=(metric_value),
             )
+
+    # ==========================================================
+    # Metric Mean Helpers
+    # ==============================================================
 
     def mean_routing_metric(
         self,
@@ -3813,6 +1830,12 @@ class EpisodeStatistics:
 
         return float(sums[metric_name] / count)
 
+    # ==========================================================
+    # Finalized Job Causal Trace
+    #
+    # 必须在 Replay 写入成功以后调用。
+    # ==============================================================
+
     def record_finalized_trace(
         self,
         finalized_trace: FinalizedJobTrace,
@@ -3821,22 +1844,16 @@ class EpisodeStatistics:
         self.terminal_trace_flushed_count += 1
 
         routing_transition_count = len(finalized_trace.routing_transitions)
-        for transition in finalized_trace.routing_transitions:
-            if not transition.done:
-                self.heuristic_nonterminal_count += 1
-                self.heuristic_score_sum += transition.next_heuristic_score
-                self.heuristic_valid_score_count += int(transition.heuristic_valid)
-            if self.reward_shaping_enabled:
-                self.heuristic_reward_sum += (
-                    self.routing_gamma
-                    * (1 - self.heuristic_beta)
-                    * transition.next_heuristic_score
-                )
 
         self.routing_transition_flushed_count += routing_transition_count
 
         if finalized_trace.host_transition is not None:
             self.host_transition_flushed_count += 1
+
+        # ------------------------------------------------------
+        # Multi-hop 统计的是 Edge -> Edge forwarding 次数。
+        # Self 本身不是 Edge forwarding hop。
+        # ------------------------------------------------------
 
         edge_hops = sum(
             1
@@ -3845,7 +1862,6 @@ class EpisodeStatistics:
         )
 
         self.routing_edge_hop_total += int(edge_hops)
-        self.routing_edge_hops_by_job.append(int(edge_hops))
 
         self.max_routing_hops = max(
             self.max_routing_hops,
@@ -3855,62 +1871,16 @@ class EpisodeStatistics:
         if edge_hops >= 2:
             self.multi_hop_job_count += 1
 
-        first_edge_seen = False
-        routing_steps = tuple(finalized_trace.routing_steps)
-        for index, step in enumerate(routing_steps):
-            if str(step.action_type) != "edge_dc":
-                continue
-            if index + 1 >= len(routing_steps):
-                raise RuntimeError(
-                    f"Edge step has no successor: job={finalized_trace.job_id}, sequence={step.sequence_index}"
-                )
-            successor = routing_steps[index + 1]
-            if str(successor.agent_id) != str(step.target_dc_id):
-                raise RuntimeError(
-                    f"Edge successor target mismatch: job={finalized_trace.job_id}, "
-                    f"expected={step.target_dc_id}, actual={successor.agent_id}"
-                )
-            successor_type = str(successor.action_type)
-            if successor_type == "self":
-                host_result = (
-                    None
-                    if finalized_trace.host_step is None
-                    else str(finalized_trace.host_step.execution_result)
-                )
-                outcome = "self" if host_result in {"started", "queued"} else "drop"
-            elif successor_type == "edge_dc":
-                outcome = "edge"
-            elif successor_type == "cloud":
-                outcome = "cloud"
-            elif successor_type == "drop":
-                outcome = "drop"
-            else:
-                raise RuntimeError(f"Unknown Edge successor action: {successor_type}")
-
-            self.edge_successor_total += 1
-            setattr(
-                self,
-                f"edge_successor_{outcome}_count",
-                int(getattr(self, f"edge_successor_{outcome}_count")) + 1,
-            )
-            target_dc_id = str(step.target_dc_id)
-            self._inc_dc(target_dc_id, "incoming_edge_successor_count")
-            self._inc_dc(target_dc_id, f"incoming_edge_{outcome}_count")
-            pair = f"{step.source_dc_id}->{target_dc_id}"
-            pair_counts = self.absorption_pair_counts.setdefault(
-                pair, {name: 0 for name in ("self", "edge", "cloud", "drop")}
-            )
-            pair_counts[outcome] += 1
-            if not first_edge_seen:
-                self.first_edge_successor_total += 1
-                self.first_edge_absorbed_count += int(outcome == "self")
-                first_edge_seen = True
+        # ------------------------------------------------------
+        # 两层 Replay reward 分开统计。
+        #
+        # 注意：
+        # Routing reward + Host reward
+        # 不能作为 system reward。
+        # ------------------------------------------------------
 
         self.routing_layer_reward_sum += float(
-            sum(
-                float(transition.reward)
-                for transition in finalized_trace.routing_transitions
-            )
+            sum(float(transition.reward) for transition in finalized_trace.routing_transitions)
         )
 
         if finalized_trace.host_transition is not None:
@@ -3920,6 +1890,15 @@ class EpisodeStatistics:
 def validate_training_stage_config(
     train_config: TrainConfig,
 ) -> None:
+
+    for name in ("routing_batch_size", "host_batch_size", "routing_train_every", "host_train_every",
+                 "routing_updates_per_train", "host_updates_per_train", "log_interval"):
+        if int(getattr(train_config, name)) <= 0:
+            raise ValueError(f"{name} must be positive")
+    for name in ("routing_random_warmup_steps", "host_random_warmup_steps",
+                 "routing_learning_starts", "host_learning_starts"):
+        if int(getattr(train_config, name)) < 0:
+            raise ValueError(f"{name} must be nonnegative")
 
     host_pretrain = int(train_config.host_pretrain_episodes)
 
@@ -4067,6 +2046,7 @@ def apply_training_stage_modes(
 
         return
 
+    # Joint fine-tune
     routing_masac.train_mode()
 
     for host_agent in host_sac_agents.values():
@@ -4090,9 +2070,7 @@ def get_self_routing_action(
     action = env.routing_dc_id_to_action.get(agent_id)
 
     if action is None:
-        raise RuntimeError(
-            "找不到当前 DC 对应的 Self " "Routing action：" f"dc={agent_id}"
-        )
+        raise RuntimeError("找不到当前 DC 对应的 Self " "Routing action：" f"dc={agent_id}")
 
     decoded = env._decode_action(
         agent_id=agent_id,
@@ -4101,10 +2079,7 @@ def get_self_routing_action(
 
     if str(decoded["action_type"]) != "self":
         raise RuntimeError(
-            "Stage 1 Self bypass "
-            "动作编码错误："
-            f"dc={agent_id}, "
-            f"action={action}"
+            "Stage 1 Self bypass " "动作编码错误：" f"dc={agent_id}, " f"action={action}"
         )
 
     return int(action)
@@ -4157,24 +2132,14 @@ def _convert_update_block_to_cpu(
         reference_value = update_info["critic_loss"]
 
         reference_device = (
-            reference_value.device
-            if torch.is_tensor(reference_value)
-            else torch.device("cpu")
+            reference_value.device if torch.is_tensor(reference_value) else torch.device("cpu")
         )
 
         metric_tensors = []
 
         for metric_name in UPDATE_TENSOR_METRIC_NAMES:
 
-            if metric_name in {
-                "heuristic_reward_mean",
-                "modified_reward_mean",
-                "raw_reward_mean",
-                "effective_gamma",
-            }:
-                metric_value = update_info.get(metric_name, float("nan"))
-            else:
-                metric_value = update_info[metric_name]
+            metric_value = update_info[metric_name]
 
             if torch.is_tensor(metric_value):
                 metric_tensor = (
@@ -4218,28 +2183,12 @@ def _convert_update_block_to_cpu(
     ]
 
 
-def record_routing_update_block(
-    stats: EpisodeStatistics,
-    update_infos: list[
-        Dict[
-            str,
-            Union[
-                float,
-                torch.Tensor,
-            ],
-        ]
-    ],
-) -> None:
-    """
-    只记录 Routing MASAC update 指标。
-    """
-
+def record_routing_update_block(stats, dc_id, update_infos) -> None:
     stats.pending_routing_update_infos.extend(
-        {
-            name: value.detach() if torch.is_tensor(value) else value
-            for name, value in update_info.items()
-        }
-        for update_info in update_infos
+        (str(dc_id), int(info.get('sample_count', 1)),
+         {name: value.detach() if torch.is_tensor(value) else value
+          for name, value in info.items() if name != 'sample_count'})
+        for info in update_infos
     )
 
 
@@ -4274,8 +2223,11 @@ def record_host_update_block(
 
 def flush_pending_update_metrics(stats: EpisodeStatistics) -> None:
     """Read detached update metrics once per episode, before building logs."""
-    for update_info in _convert_update_block_to_cpu(stats.pending_routing_update_infos):
-        stats.record_routing_update(update_info)
+    routing_updates = stats.pending_routing_update_infos
+    for (dc_id, sample_count, _), update_info in zip(
+        routing_updates, _convert_update_block_to_cpu([info for _, _, info in routing_updates])
+    ):
+        stats.record_routing_update(update_info, dc_id, sample_count)
     stats.pending_routing_update_infos.clear()
 
     host_updates = stats.pending_host_update_infos
@@ -4294,8 +2246,6 @@ def flush_finalized_trace_to_replay(
     stats: EpisodeStatistics,
     neighbor_feedback_store: NeighborHistoricalFeedbackStore,
     collect_neighbor_historical_feedback: bool,
-    bayesian_game: Optional[BayesianCongestionGame] = None,
-    env: Optional[CloudEdgeEnv] = None,
 ) -> None:
     """
     把一个已经完整 Finalize 的 Job
@@ -4315,19 +2265,16 @@ def flush_finalized_trace_to_replay(
             ↓
         对应 DC 的 HostReplayBuffer
 
-        Cloud / Drop：
+    Cloud / Drop：
         不产生 HostTransition。
-
-    Bayesian Evidence（可选接入）：
-        FinalizedJobTrace
-            ↓
-        BayesianHistoricalEvidence
-            ↓
-        BayesianBeliefStore
-
-    ``bayesian_game`` 默认保持 None，确保当前 H-MASAC-equivalent
-    Zero-Diff 路径不会额外启用 Bayesian 状态更新。
     """
+
+    # ==========================================================
+    # 先检查 Host Buffer 是否存在。
+    #
+    # 在真正写 Routing Replay 前先检查，
+    # 避免 Host buffer 配置错误造成半写入状态。
+    # ==========================================================
 
     host_transition = finalized_trace.host_transition
 
@@ -4347,32 +2294,39 @@ def flush_finalized_trace_to_replay(
                 f"dc={host_dc_id}"
             )
 
-    bayesian_evidences = tuple()
-    if bayesian_game is not None:
-        if env is None:
-            raise RuntimeError("启用 Bayesian Evidence 转换时必须提供 Environment。")
-        bayesian_evidences = build_bayesian_evidence_from_finalized_trace(
-            finalized_trace,
-            env,
-        )
+    # ==========================================================
+    # Routing Replay
+    # ==========================================================
 
     for routing_transition in finalized_trace.routing_transitions:
 
         routing_replay_buffer.add(routing_transition)
 
+    # ==========================================================
+    # Host Replay
+    #
+    # 一个 Self Job 最多写一条。
+    # ==========================================================
+
     if host_transition is not None and host_replay_buffer is not None:
         host_replay_buffer.add(host_transition)
+
+    # ==============================================================
+    # Routing / Host 两个 ReplayBuffer 全部写入成功以后，
+    # 才把这条完整 Job 因果链计入 Episode 日志。
+    #
+    # 这样日志中的：
+    #
+    #   terminal_trace_flushed_count
+    #   routing_transition_flushed_count
+    #   host_transition_flushed_count
+    #
+    # 与真正成功写入 Replay 的经验严格一致。
+    # ==============================================================
 
     stats.record_finalized_trace(finalized_trace)
     if collect_neighbor_historical_feedback:
         neighbor_feedback_store.update_from_finalized_trace(finalized_trace)
-
-    if bayesian_game is not None:
-        for evidence in bayesian_evidences:
-            bayesian_game.update_belief(
-                evidence,
-                update_clock=float(env.current_time),
-            )
 
 
 def consume_environment_outcome_events(
@@ -4384,7 +2338,6 @@ def consume_environment_outcome_events(
     neighbor_feedback_store: NeighborHistoricalFeedbackStore,
     collect_neighbor_historical_feedback: bool,
     training_reward_model: HMasacTrainingRewardModel,
-    bayesian_game: Optional[BayesianCongestionGame] = None,
 ) -> None:
     """
     第十九步以后：
@@ -4406,6 +2359,10 @@ def consume_environment_outcome_events(
         不允许修改正式 ReplayBuffer。
     """
 
+    # ==============================================================
+    # Environment 只返回 Job Outcome Facts。
+    # ==============================================================
+
     outcome_events = env.pop_job_outcome_events()
 
     if not outcome_events:
@@ -4426,9 +2383,15 @@ def consume_environment_outcome_events(
             )
         )
 
-        reward_delta = float(
-            training_reward_model.calculate_outcome_reward(outcome_event)
-        )
+        # ==========================================================
+        # 真正 Training Reward 在 Trainer 侧生成。
+        # ==============================================================
+
+        reward_delta = float(training_reward_model.calculate_outcome_reward(outcome_event))
+
+        # ======================================================
+        # 1. Reward Event 永远先进入因果链。
+        # ======================================================
 
         pending_trace_store.record_reward_event(
             job_id=job_id,
@@ -4438,6 +2401,13 @@ def consume_environment_outcome_events(
             terminal=is_terminal,
         )
 
+        # ======================================================
+        # 2. Episode statistics：
+        #
+        # 这里只做统计归因。
+        # 不再修改任何 ReplayBuffer。
+        # ======================================================
+
         if is_terminal:
 
             finalized_trace = pending_trace_store.finalize_terminal_trace(job_id=job_id)
@@ -4445,9 +2415,12 @@ def consume_environment_outcome_events(
             correction_agent_id = None
 
             if finalized_trace.routing_transitions:
-                correction_agent_id = str(
-                    finalized_trace.routing_transitions[-1].agent_id
-                )
+                correction_agent_id = str(finalized_trace.routing_transitions[-1].agent_id)
+
+            # ==================================================
+            # 3. Job terminal 后，
+            #    一次性写入两个正式经验池。
+            # ==================================================
 
             flush_finalized_trace_to_replay(
                 finalized_trace=(finalized_trace),
@@ -4455,12 +2428,13 @@ def consume_environment_outcome_events(
                 host_replay_buffers=(host_replay_buffers),
                 stats=stats,
                 neighbor_feedback_store=(neighbor_feedback_store),
-                collect_neighbor_historical_feedback=(
-                    collect_neighbor_historical_feedback
-                ),
-                bayesian_game=bayesian_game,
-                env=env,
+                collect_neighbor_historical_feedback=(collect_neighbor_historical_feedback),
             )
+
+            # ==================================================
+            # 4. Replay 写入成功以后，
+            #    才允许从 Finalized Trace Store 移除。
+            # ==================================================
 
             pending_trace_store.pop_finalized_trace(job_id)
 
@@ -4472,6 +2446,15 @@ def consume_environment_outcome_events(
                 )
 
             continue
+
+        # ======================================================
+        # Non-terminal delayed reward：
+        #
+        # 只记录在 Causal Trace。
+        # 不修改 Replay。
+        #
+        # Episode statistics 仍然正常记录。
+        # ======================================================
 
         pending_trace = pending_trace_store.get_trace(job_id)
 
@@ -4491,18 +2474,27 @@ def consume_environment_outcome_events(
             )
 
 
-def set_global_random_seeds(seed: int) -> None:
+def set_global_random_seeds(seed: int, device: Optional[str] = None) -> None:
     """统一设置 Python、NumPy 和 PyTorch 随机种子。"""
 
+    # 转换成标准 Python int。
     seed = int(seed)
 
+    # 设置 Python random 随机种子。
     random.seed(seed)
 
+    # 设置 NumPy 旧式全局随机接口的种子。
+    # ReplayBuffer 和预热动作仍会使用各自独立的 default_rng。
     np.random.seed(seed)
 
-    torch.manual_seed(seed)
+    # 设置 CPU 上的 PyTorch 随机种子。
+    if device is not None and torch.device(device).type == "cpu":
+        torch.random.default_generator.manual_seed(seed)
+    else:
+        torch.manual_seed(seed)
 
-    if torch.cuda.is_available():
+    # CUDA 可用时设置所有 GPU 的随机种子。
+    if (device is None or torch.device(device).type == "cuda") and torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
 
@@ -4539,12 +2531,16 @@ def choose_random_routing_action(
 def count_completed_jobs(env: Any) -> int:
     completed_count = 0
     for datacenter in getattr(env, "datacenters", []):
+        # 遍历当前数据中心的全部 host。
         for host in getattr(datacenter, "host_list", []):
+            # 读取 host 完成队列。
             completed_queue = getattr(host, "completed_queue", None)
 
+            # 没有完成队列时跳过。
             if completed_queue is None:
                 continue
 
+            # 将该 host 的完成任务数量加入总数。
             completed_count += len(completed_queue)
     return int(completed_count)
 
@@ -4609,23 +2605,18 @@ def calculate_service_metrics(env: Any) -> Dict[str, float]:
 
     completed_count = len(completed_jobs)
 
-    avg_completion_time = (
-        total_completion_time / completed_count if completed_count > 0 else 0.0
-    )
+    avg_completion_time = total_completion_time / completed_count if completed_count > 0 else 0.0
 
+    # Drop 直接视为最严重 SLA violation，degree = 1。
     total_violation_degree += float(dropped_jobs)
 
     sla_satisfaction_rate = sla_satisfied_jobs / total_jobs if total_jobs > 0 else 0.0
 
     sla_violation_rate = (
-        (sla_violated_completed_jobs + dropped_jobs) / total_jobs
-        if total_jobs > 0
-        else 0.0
+        (sla_violated_completed_jobs + dropped_jobs) / total_jobs if total_jobs > 0 else 0.0
     )
 
-    mean_sla_violation_degree = (
-        total_violation_degree / total_jobs if total_jobs > 0 else 0.0
-    )
+    mean_sla_violation_degree = total_violation_degree / total_jobs if total_jobs > 0 else 0.0
 
     return {
         "sla_satisfied_jobs": int(sla_satisfied_jobs),
@@ -4739,10 +2730,12 @@ def calculate_resource_timeline_metrics(
                 0,
             ]
 
+        # 任务开始：CPU/GPU/Running Count 增加。
         events[start_time][0] += cpu_request
         events[start_time][1] += gpu_request
         events[start_time][2] += 1
 
+        # 任务结束：CPU/GPU/Running Count 释放。
         events[finish_time][0] -= cpu_request
         events[finish_time][1] -= gpu_request
         events[finish_time][2] -= 1
@@ -4765,6 +2758,7 @@ def calculate_resource_timeline_metrics(
             0.0,
         )
 
+        # 在前一个事件到当前事件之间，如果至少有一个 Job 在运行，则 Host/System 是 busy 状态。
         if current_running_jobs > 0:
             busy_time_s += interval_s
 
@@ -4773,6 +2767,7 @@ def calculate_resource_timeline_metrics(
         current_used_cpu += float(cpu_delta)
         current_used_gpu += float(gpu_delta)
         current_running_jobs += int(running_delta)
+        # 防止浮点残差产生 -1e-15 一类值。
         current_used_cpu = max(
             current_used_cpu,
             0.0,
@@ -4966,9 +2961,7 @@ def calculate_episode_load_metrics(
         dc_arrival_count = int(dc_arrival_times.size)
 
         if dc_arrival_count >= 2:
-            dc_arrival_span_s = float(
-                np.max(dc_arrival_times) - np.min(dc_arrival_times)
-            )
+            dc_arrival_span_s = float(np.max(dc_arrival_times) - np.min(dc_arrival_times))
             dc_observed_arrival_rate = safe_ratio(
                 dc_arrival_count - 1,
                 dc_arrival_span_s,
@@ -5012,9 +3005,7 @@ def calculate_episode_load_metrics(
             ),
             "configured_arrival_probability": (configured_probability),
             "configured_arrival_rate": (configured_arrival_rate),
-            "expected_exogenous_arrival_count": float(
-                len(all_jobs) * configured_probability
-            ),
+            "expected_exogenous_arrival_count": float(len(all_jobs) * configured_probability),
             "exogenous_arrival_count": dc_arrival_count,
             "exogenous_arrival_share": safe_ratio(
                 dc_arrival_count,
@@ -5184,12 +3175,8 @@ def calculate_episode_load_metrics(
         jobs=cloud_jobs,
         episode_duration_s=episode_duration_s,
     )
-    edge_cpu_host_mean = (
-        float(np.mean(edge_host_cpu_avg_loads)) if edge_host_cpu_avg_loads else 0.0
-    )
-    edge_cpu_host_std = (
-        float(np.std(edge_host_cpu_avg_loads)) if edge_host_cpu_avg_loads else 0.0
-    )
+    edge_cpu_host_mean = float(np.mean(edge_host_cpu_avg_loads)) if edge_host_cpu_avg_loads else 0.0
+    edge_cpu_host_std = float(np.std(edge_host_cpu_avg_loads)) if edge_host_cpu_avg_loads else 0.0
     edge_cpu_host_p95 = (
         float(
             np.percentile(
@@ -5200,12 +3187,8 @@ def calculate_episode_load_metrics(
         if edge_host_cpu_avg_loads
         else 0.0
     )
-    edge_gpu_host_mean = (
-        float(np.mean(edge_host_gpu_avg_loads)) if edge_host_gpu_avg_loads else 0.0
-    )
-    edge_gpu_host_std = (
-        float(np.std(edge_host_gpu_avg_loads)) if edge_host_gpu_avg_loads else 0.0
-    )
+    edge_gpu_host_mean = float(np.mean(edge_host_gpu_avg_loads)) if edge_host_gpu_avg_loads else 0.0
+    edge_gpu_host_std = float(np.std(edge_host_gpu_avg_loads)) if edge_host_gpu_avg_loads else 0.0
 
     if len(arrival_times) >= 2:
         arrival_span_s = float(np.max(arrival_times) - np.min(arrival_times))
@@ -5234,33 +3217,15 @@ def calculate_episode_load_metrics(
             ensure_ascii=False,
             sort_keys=True,
         ),
-        "workload_total_cpu_request": (
-            float(np.sum(cpu_requests)) if cpu_requests.size else 0.0
-        ),
-        "workload_mean_cpu_request": (
-            float(np.mean(cpu_requests)) if cpu_requests.size else 0.0
-        ),
-        "workload_max_cpu_request": (
-            float(np.max(cpu_requests)) if cpu_requests.size else 0.0
-        ),
-        "workload_total_gpu_request": (
-            float(np.sum(gpu_requests)) if gpu_requests.size else 0.0
-        ),
-        "workload_mean_gpu_request": (
-            float(np.mean(gpu_requests)) if gpu_requests.size else 0.0
-        ),
-        "workload_max_gpu_request": (
-            float(np.max(gpu_requests)) if gpu_requests.size else 0.0
-        ),
-        "workload_gpu_job_ratio": (
-            float(np.mean(gpu_requests > 0.0)) if gpu_requests.size else 0.0
-        ),
-        "workload_total_duration_s": (
-            float(np.sum(durations)) if durations.size else 0.0
-        ),
-        "workload_mean_duration_s": (
-            float(np.mean(durations)) if durations.size else 0.0
-        ),
+        "workload_total_cpu_request": float(np.sum(cpu_requests)) if cpu_requests.size else 0.0,
+        "workload_mean_cpu_request": float(np.mean(cpu_requests)) if cpu_requests.size else 0.0,
+        "workload_max_cpu_request": float(np.max(cpu_requests)) if cpu_requests.size else 0.0,
+        "workload_total_gpu_request": float(np.sum(gpu_requests)) if gpu_requests.size else 0.0,
+        "workload_mean_gpu_request": float(np.mean(gpu_requests)) if gpu_requests.size else 0.0,
+        "workload_max_gpu_request": float(np.max(gpu_requests)) if gpu_requests.size else 0.0,
+        "workload_gpu_job_ratio": float(np.mean(gpu_requests > 0.0)) if gpu_requests.size else 0.0,
+        "workload_total_duration_s": float(np.sum(durations)) if durations.size else 0.0,
+        "workload_mean_duration_s": float(np.mean(durations)) if durations.size else 0.0,
         "workload_p95_duration_s": (
             float(
                 np.percentile(
@@ -5279,6 +3244,7 @@ def calculate_episode_load_metrics(
         "edge_total_gpu_capacity": float(edge_total_gpu_capacity),
         "edge_cpu_resource_seconds": float(edge_timeline["cpu_resource_seconds"]),
         "edge_gpu_resource_seconds": float(edge_timeline["gpu_resource_seconds"]),
+        # 整个 Edge 系统容量加权、时间加权平均负载。
         "edge_avg_cpu_load": safe_ratio(
             edge_timeline["avg_used_cpu"],
             edge_total_cpu_capacity,
@@ -5297,6 +3263,9 @@ def calculate_episode_load_metrics(
         ),
         "edge_avg_running_jobs": float(edge_timeline["avg_running_jobs"]),
         "edge_peak_running_jobs": int(edge_timeline["peak_running_jobs"]),
+        # 每台 Edge Host 平均 CPU Load 的均值、标准差、P95。
+        #
+        # std 越大说明长期负载越不均衡。
         "edge_host_avg_cpu_load_mean": edge_cpu_host_mean,
         "edge_host_avg_cpu_load_std": edge_cpu_host_std,
         "edge_host_avg_cpu_load_p95": edge_cpu_host_p95,
@@ -5412,9 +3381,7 @@ def calculate_episode_energy_metrics(
         )
     )
 
-    edge_total_energy_j = (
-        edge_idle_energy_j + edge_cpu_dynamic_energy_j + edge_gpu_dynamic_energy_j
-    )
+    edge_total_energy_j = edge_idle_energy_j + edge_cpu_dynamic_energy_j + edge_gpu_dynamic_energy_j
 
     system_compute_energy_j = edge_total_energy_j + cloud_compute_energy_j
 
@@ -5482,12 +3449,16 @@ def calculate_episode_energy_metrics(
 
     completed_jobs = count_completed_jobs(env)
 
+    # 系统 Transmission 总量应该与 EE + EC 严格一致。
     transfer_split_gap_j = (
         transfer_energy_j - edge_edge_transfer_energy_j - edge_cloud_transfer_energy_j
     )
 
+    # 系统账本与全部 Job 的 Transmission attribution
+    # 正常情况下也应该一致。
     transfer_job_accounting_gap_j = transfer_energy_j - task_transfer_energy_j
 
+    # Energy clock 与 Simulation clock 应在 Episode 结束时一致。
     energy_time_gap_s = simulation_end_time_s - energy_end_time_s
 
     return {
@@ -5529,6 +3500,9 @@ def calculate_episode_energy_metrics(
             system_compute_energy_j,
             energy_time_s,
         ),
+        # Transmission 模型是离散一次性 Energy，
+        # 这里写的是 Episode horizon 上的等效平均能量率，
+        # 不是单条链路的瞬时物理功率。
         "transfer_equivalent_avg_power_w": safe_ratio(
             transfer_energy_j,
             energy_time_s,
@@ -5592,7 +3566,7 @@ def build_checkpoint_structure_metadata(
     ],
 ) -> Dict[str, Any]:
     """
-    构造 checkpoint 的结构身份信息。
+    构造 MR-H-MASAC checkpoint 的结构身份信息。
 
     这些信息不是训练指标，而是判断：
         “当前运行环境是否仍然与该 checkpoint 兼容”
@@ -5626,9 +3600,7 @@ def build_checkpoint_structure_metadata(
         dc = base_dc_map.get(dc_id)
 
         if dc is None:
-            raise RuntimeError(
-                "构造 checkpoint metadata 时 " "找不到 Edge DC：" f"{dc_id}"
-            )
+            raise RuntimeError("构造 checkpoint metadata 时 " "找不到 Edge DC：" f"{dc_id}")
 
         host_ids = [str(host.host_id) for host in dc.host_list]
 
@@ -5646,25 +3618,15 @@ def build_checkpoint_structure_metadata(
 
     return {
         "cloud_enabled": bool(env.enable_cloud_action),
+        # 顺序必须保存。
+        # Routing 网络选择和 action index
+        # 都依赖这些顺序。
         "edge_dc_ids": edge_dc_ids,
-        "routing_action_target_dc_ids": [
-            str(dc_id) for dc_id in env.routing_action_target_dc_ids
-        ],
+        "routing_action_target_dc_ids": [str(dc_id) for dc_id in env.routing_action_target_dc_ids],
+        # Host action index 同样依赖 host_list 顺序，
+        # 不能只比较 Host 数量。
         "host_count_per_dc": host_count_per_dc,
         "host_ids_per_dc": host_ids_per_dc,
-        "host_capacities_per_dc": {
-            dc_id: [
-                [float(host.cpu_num), float(host.gpu_capacity_num)]
-                for host in base_dc_map[dc_id].host_list
-            ]
-            for dc_id in edge_dc_ids
-        },
-        "routing_links": [
-            [source, target, float(env.base_graph[source][target]["weight"])]
-            for source in edge_dc_ids
-            for target in env.routing_action_target_dc_ids
-            if target != source
-        ],
         "routing": {
             "local_obs_dim": int(routing_masac.local_obs_dim),
             "global_state_dim": int(routing_masac.global_state_dim),
@@ -5672,6 +3634,11 @@ def build_checkpoint_structure_metadata(
             "num_agents": int(routing_masac.num_agents),
         },
         "hosts": host_model_metadata,
+        **(
+            {"routing_observation": routing_masac.observation_metadata}
+            if routing_masac.observation_metadata is not None
+            else {}
+        ),
     }
 
 
@@ -5709,14 +3676,17 @@ def validate_checkpoint_structure_metadata(
             "architecture",
             "",
         )
-    ).replace("_masca_", "_masac_")
+    )
 
-    if architecture != CHECKPOINT_ARCHITECTURE:
+    expected_architecture = getattr(
+        routing_masac, "checkpoint_architecture", CHECKPOINT_ARCHITECTURE
+    )
+    if architecture != expected_architecture:
         raise RuntimeError(
             "Checkpoint architecture 不兼容："
             f"saved={architecture!r}, "
             f"current="
-            f"{CHECKPOINT_ARCHITECTURE!r}"
+            f"{expected_architecture!r}"
         )
 
     saved_structure = checkpoint_metadata.get("structure", {})
@@ -5726,6 +3696,16 @@ def validate_checkpoint_structure_metadata(
         routing_masac=(routing_masac),
         host_sac_agents=(host_sac_agents),
     )
+
+    if current_structure.get("routing_observation") != saved_structure.get("routing_observation"):
+        raise RuntimeError("Checkpoint routing observation schema 不兼容")
+
+    # ==========================================================
+    # Cloud Action
+    #
+    # Cloud ON/OFF 会直接改变 Routing action space，
+    # 因此不允许跨配置恢复。
+    # ==========================================================
 
     saved_cloud_enabled = bool(
         saved_structure.get(
@@ -5743,6 +3723,10 @@ def validate_checkpoint_structure_metadata(
             f"current={current_cloud_enabled}"
         )
 
+    # ==========================================================
+    # Edge DC identity / order
+    # ==========================================================
+
     saved_edge_dc_ids = list(
         saved_structure.get(
             "edge_dc_ids",
@@ -5759,6 +3743,10 @@ def validate_checkpoint_structure_metadata(
             f"current={current_edge_dc_ids}"
         )
 
+    # ==========================================================
+    # Routing action semantic mapping
+    # ==========================================================
+
     saved_targets = list(
         saved_structure.get(
             "routing_action_target_dc_ids",
@@ -5774,6 +3762,10 @@ def validate_checkpoint_structure_metadata(
             f"saved={saved_targets}, "
             f"current={current_targets}"
         )
+
+    # ==========================================================
+    # Routing dimensions
+    # ==========================================================
 
     saved_routing = saved_structure.get("routing", {})
 
@@ -5800,12 +3792,20 @@ def validate_checkpoint_structure_metadata(
                 f"{current_routing[field_name]}"
             )
 
+    # ==========================================================
+    # Host physical mapping
+    # ==========================================================
+
     saved_host_ids = saved_structure.get("host_ids_per_dc", {})
 
     current_host_ids = current_structure["host_ids_per_dc"]
 
     if saved_host_ids != current_host_ids:
         raise RuntimeError("Checkpoint Host ID / action mapping " "与当前环境不兼容。")
+
+    # ==========================================================
+    # Host SAC dimensions
+    # ==========================================================
 
     saved_hosts = saved_structure.get("hosts", {})
 
@@ -5885,14 +3885,16 @@ def save_two_layer_checkpoint(
 
     checkpoint_metadata = {
         "schema_version": int(CHECKPOINT_SCHEMA_VERSION),
-        "architecture": CHECKPOINT_ARCHITECTURE,
-        "bcgh2_guidance": bcgh_guidance_metadata(train_config),
+        "architecture": getattr(routing_masac, "checkpoint_architecture", CHECKPOINT_ARCHITECTURE),
         "saved_training_stage": str(training_stage.value),
         "structure": build_checkpoint_structure_metadata(
             env=env,
             routing_masac=(routing_masac),
             host_sac_agents=(host_sac_agents),
         ),
+        # 训练阶段长度保存下来主要用于实验追溯。
+        # 不把它作为神经网络结构兼容性的硬约束，
+        # 因为后续可能人为延长 Joint Fine-tune。
         "training_schedule": {
             "num_episodes": int(train_config.num_episodes),
             "host_pretrain_episodes": int(train_config.host_pretrain_episodes),
@@ -5903,20 +3905,23 @@ def save_two_layer_checkpoint(
             "next_episode": int(next_episode),
             "global_decision_steps": int(global_decision_steps),
             "routing_normal_action_steps": int(routing_normal_action_steps),
+            "routing_action_steps_by_dc": dict(routing_masac.action_steps),
+            "routing_last_train_action_steps_by_dc": dict(routing_masac.last_train_action_steps),
+            # 作为全局诊断量保存。
             "routing_global_steps": int(routing_normal_action_steps),
             "host_training_action_steps": {
                 str(dc_id): int(step_count)
                 for dc_id, step_count in host_training_action_steps.items()
             },
             "host_global_steps": int(
-                sum(
-                    int(step_count)
-                    for step_count in host_training_action_steps.values()
-                )
+                sum(int(step_count) for step_count in host_training_action_steps.values())
             ),
             "best_episode_return": float(best_episode_return),
         },
     }
+
+    if routing_masac.observation_metadata is not None:
+        checkpoint_metadata["scheduler_config"] = asdict(train_config)
 
     state_path = checkpoint_state_path(model_path)
 
@@ -5983,7 +3988,23 @@ def load_two_layer_checkpoint_if_needed(
         best_episode_return
     """
 
+    # ==========================================================
+    # 默认 Host Training Step
+    #
+    # 只有在“完全没有指定 Resume checkpoint”的情况下，
+    # 才允许使用这些默认值开始全新训练。
+    #
+    # 一旦用户明确指定 checkpoint，
+    # 就不允许因为 metadata 缺失而偷偷回到 0。
+    # ==========================================================
+
     default_host_steps = {str(dc_id): 0 for dc_id in host_sac_agents.keys()}
+
+    # ==========================================================
+    # 0. 没有指定 Resume checkpoint
+    #
+    # 这是唯一允许从 Episode 1 / Step 0 开始的情况。
+    # ==========================================================
 
     if resume_checkpoint is None:
         return (
@@ -5994,29 +4015,57 @@ def load_two_layer_checkpoint_if_needed(
             float("-inf"),  # best_episode_return
         )
 
+    # ==========================================================
+    # 1. Routing checkpoint 路径
+    # ==========================================================
+
     model_path = Path(resume_checkpoint)
 
     if not model_path.exists():
         raise FileNotFoundError("找不到 Routing MASAC checkpoint：" f"{model_path}")
 
     if not model_path.is_file():
-        raise FileNotFoundError(
-            "Routing MASAC checkpoint 不是有效文件：" f"{model_path}"
-        )
+        raise FileNotFoundError("Routing MASAC checkpoint 不是有效文件：" f"{model_path}")
+
+    # ==========================================================
+    # 2. Host checkpoint 目录
+    #
+    # 例如：
+    #
+    #   latest.pt
+    #
+    # 对应：
+    #
+    #   latest_hosts/
+    #       DC1.pt
+    #       DC2.pt
+    #       ...
+    # ==========================================================
 
     host_dir = host_checkpoint_dir(model_path)
 
     if not host_dir.exists():
         raise FileNotFoundError(
-            "恢复 Two-Level checkpoint 时找不到 "
-            "Local Host SAC checkpoint 目录："
-            f"{host_dir}"
+            "恢复 Two-Level checkpoint 时找不到 " "Local Host SAC checkpoint 目录：" f"{host_dir}"
         )
 
     if not host_dir.is_dir():
-        raise FileNotFoundError(
-            "Local Host SAC checkpoint 路径不是目录：" f"{host_dir}"
-        )
+        raise FileNotFoundError("Local Host SAC checkpoint 路径不是目录：" f"{host_dir}")
+
+    # ==========================================================
+    # 3. 在加载任何模型参数以前，
+    #    先检查所有 DC 的 Host checkpoint 是否完整。
+    #
+    # 不能出现：
+    #
+    #   Routing 已经 load
+    #       ↓
+    #   DC3 Host checkpoint 不存在
+    #       ↓
+    #   当前进程模型进入“半恢复”状态
+    #
+    # 因此这里首先只检查文件，不修改模型。
+    # ==========================================================
 
     expected_host_paths: Dict[
         str,
@@ -6038,11 +4087,22 @@ def load_two_layer_checkpoint_if_needed(
 
         if not host_path.is_file():
             raise FileNotFoundError(
-                "Local Host SAC checkpoint "
-                "不是有效文件："
-                f"dc={dc_id}, "
-                f"path={host_path}"
+                "Local Host SAC checkpoint " "不是有效文件：" f"dc={dc_id}, " f"path={host_path}"
             )
+
+    # ==========================================================
+    # 4. Trainer Metadata
+    #
+    # 新 checkpoint 中：
+    #
+    #   *.trainer.json
+    #
+    # 不再是“可有可无”的辅助文件，
+    # 而是整个 Two-Level checkpoint 的结构声明与
+    # 完整写入标志。
+    #
+    # 因此缺少它时必须 fail-fast。
+    # ==========================================================
 
     state_path = checkpoint_state_path(model_path)
 
@@ -6053,6 +4113,10 @@ def load_two_layer_checkpoint_if_needed(
 
     if not state_path.is_file():
         raise FileNotFoundError("Trainer metadata 不是有效文件：" f"{state_path}")
+
+    # ==========================================================
+    # 5. 读取完整 checkpoint metadata
+    # ==========================================================
 
     try:
         checkpoint_metadata = json.loads(state_path.read_text(encoding="utf-8"))
@@ -6068,21 +4132,26 @@ def load_two_layer_checkpoint_if_needed(
         checkpoint_metadata,
         dict,
     ):
-        raise RuntimeError(
-            "Two-Level checkpoint metadata " "根节点必须是 dict：" f"{state_path}"
-        )
+        raise RuntimeError("Two-Level checkpoint metadata " "根节点必须是 dict：" f"{state_path}")
 
-    saved_guidance = checkpoint_metadata.get("bcgh2_guidance")
-    if isinstance(saved_guidance, dict):
-        # This is a spelling-only rename; retain old checkpoint compatibility.
-        saved_guidance = dict(saved_guidance)
-        saved_guidance["scheduler"] = str(saved_guidance.get("scheduler", "")).replace(
-            "-MASCA", "-MASAC"
-        )
-    if saved_guidance != bcgh_guidance_metadata(train_config):
-        raise RuntimeError(
-            "Checkpoint BCGH2 scoring/training semantics differ from this run"
-        )
+    # ==========================================================
+    # 6. 验证 checkpoint 的结构身份
+    #
+    # validate_checkpoint_structure_metadata() 应检查：
+    #
+    #   schema_version
+    #   architecture
+    #   cloud_enabled
+    #   edge_dc_ids
+    #   routing_action_target_dc_ids
+    #   Routing observation/state/action dimensions
+    #   num_agents
+    #   host_ids_per_dc
+    #   每个 Host SAC obs_dim/action_dim
+    #
+    # 注意：
+    # 这里仍然没有真正 load_state_dict()。
+    # ==========================================================
 
     validate_checkpoint_structure_metadata(
         checkpoint_metadata=(checkpoint_metadata),
@@ -6090,6 +4159,18 @@ def load_two_layer_checkpoint_if_needed(
         routing_masac=(routing_masac),
         host_sac_agents=(host_sac_agents),
     )
+
+    # ==========================================================
+    # 7. 检查 saved_training_stage
+    #
+    # 它主要用于：
+    #   - checkpoint provenance；
+    #   - Resume 日志；
+    #   - 判断 checkpoint 是在哪个训练阶段产生的。
+    #
+    # Stage 本身不在这里强制要求与当前 TrainConfig
+    # 完全相同，因为后续可能人为延长 Joint Fine-tune。
+    # ==========================================================
 
     saved_training_stage_raw = checkpoint_metadata.get("saved_training_stage")
 
@@ -6102,6 +4183,18 @@ def load_two_layer_checkpoint_if_needed(
         raise RuntimeError(
             "Checkpoint 中存在未知 Training Stage：" f"{saved_training_stage_raw!r}"
         ) from exc
+
+    # ==========================================================
+    # 8. 检查 Training Schedule metadata
+    #
+    # Schedule 主要用于实验追溯。
+    #
+    # 不作为网络结构的硬兼容条件：
+    # 例如可以在已有 checkpoint 基础上延长
+    # JOINT_FINETUNE_EPISODES。
+    #
+    # 如果与当前配置不同，只给出明确警告。
+    # ==========================================================
 
     saved_training_schedule = checkpoint_metadata.get("training_schedule")
 
@@ -6159,6 +4252,10 @@ def load_two_layer_checkpoint_if_needed(
             flush=True,
         )
 
+    # ==========================================================
+    # 9. Trainer State 必须完整存在
+    # ==========================================================
+
     trainer_state = checkpoint_metadata.get("trainer_state")
 
     if not isinstance(
@@ -6171,6 +4268,8 @@ def load_two_layer_checkpoint_if_needed(
         "next_episode",
         "global_decision_steps",
         "routing_normal_action_steps",
+        "routing_action_steps_by_dc",
+        "routing_last_train_action_steps_by_dc",
         "host_training_action_steps",
         "best_episode_return",
     }
@@ -6179,9 +4278,17 @@ def load_two_layer_checkpoint_if_needed(
 
     if missing_trainer_fields:
         raise RuntimeError(
-            "Checkpoint trainer_state 缺少必要字段："
-            f"{sorted(missing_trainer_fields)}"
+            "Checkpoint trainer_state 缺少必要字段：" f"{sorted(missing_trainer_fields)}"
         )
+
+    # ==========================================================
+    # 10. 先解析 Trainer counters。
+    #
+    # 仍然没有加载模型。
+    #
+    # 目的是保证 metadata 有问题时，
+    # 当前 Routing / Host 网络保持原始初始化状态。
+    # ==========================================================
 
     start_episode = int(trainer_state["next_episode"])
 
@@ -6190,6 +4297,15 @@ def load_two_layer_checkpoint_if_needed(
     routing_normal_action_steps = int(trainer_state["routing_normal_action_steps"])
 
     best_episode_return = float(trainer_state["best_episode_return"])
+
+    # ==========================================================
+    # next_episode 合法性检查
+    #
+    # num_episodes + 1 是允许的：
+    #
+    #   例如加载已经完成 Episode 1000 的 final checkpoint，
+    #   next_episode 可以为 1001。
+    # ==========================================================
 
     if start_episode < 1:
         raise RuntimeError("Checkpoint next_episode 非法：" f"{start_episode}")
@@ -6204,9 +4320,7 @@ def load_two_layer_checkpoint_if_needed(
 
     if global_decision_steps < 0:
         raise RuntimeError(
-            "Checkpoint global_decision_steps "
-            "不能为负数："
-            f"{global_decision_steps}"
+            "Checkpoint global_decision_steps " "不能为负数：" f"{global_decision_steps}"
         )
 
     if routing_normal_action_steps < 0:
@@ -6215,6 +4329,19 @@ def load_two_layer_checkpoint_if_needed(
             "不能为负数："
             f"{routing_normal_action_steps}"
         )
+
+    # ==========================================================
+    # 11. Host Training Steps
+    #
+    # 每个 DC 的 counter 都必须存在。
+    #
+    # 不能像旧实现一样：
+    #
+    #   missing -> 0
+    #
+    # 因为这样 Resume 后某个 Host SAC 会错误地
+    # 重新进入 random warmup。
+    # ==========================================================
 
     saved_host_steps = trainer_state["host_training_action_steps"]
 
@@ -6257,10 +4384,48 @@ def load_two_layer_checkpoint_if_needed(
 
         host_training_action_steps[dc_id] = step_count
 
+    # ==========================================================
+    # 到这里为止：
+    #
+    #   文件完整性
+    #   Metadata
+    #   Schema
+    #   Environment structure
+    #   Routing structure
+    #   Host structure
+    #   Training stage
+    #   Trainer counters
+    #
+    # 已经全部验证成功。
+    #
+    # 从下面开始才允许真正修改当前模型参数。
+    # ==========================================================
+
+    # ==========================================================
+    # 12. 加载 Routing MASAC
+    # ==========================================================
+
+    routing_counters = trainer_state['routing_action_steps_by_dc']
+    routing_train_counters = trainer_state['routing_last_train_action_steps_by_dc']
+    for counters in (routing_counters, routing_train_counters):
+        if (not isinstance(counters, dict) or set(counters) != set(routing_masac.edge_dc_ids)
+                or any(type(value) is not int or value < 0 for value in counters.values())):
+            raise RuntimeError('MR-H-MASAC trainer has invalid per-DC routing counters')
+    if sum(routing_counters.values()) != routing_normal_action_steps:
+        raise RuntimeError('MR-H-MASAC aggregate routing counter mismatch')
+    routing_payload = torch.load(model_path, map_location='cpu', weights_only=False)
+    if (routing_payload.get('action_steps') != routing_counters
+            or routing_payload.get('last_train_action_steps') != routing_train_counters):
+        raise RuntimeError('MR-H-MASAC model/trainer routing counters mismatch')
+
     routing_masac.load(
         file_path=(model_path),
         load_optimizers=True,
     )
+
+    # ==========================================================
+    # 13. 加载全部 Local Host SAC
+    # ==========================================================
 
     for dc_id, host_agent in host_sac_agents.items():
 
@@ -6273,10 +4438,14 @@ def load_two_layer_checkpoint_if_needed(
             load_optimizers=True,
         )
 
+    # ==========================================================
+    # 14. Resume 成功信息
+    # ==========================================================
+
     print(
         "\n"
         "============================================================\n"
-        "✅ Two-Level BCGH2-MASAC checkpoint 恢复成功\n"
+        "✅ Two-Level MR-H-MASAC checkpoint 恢复成功\n"
         f"Routing checkpoint : {model_path}\n"
         f"Host directory     : {host_dir}\n"
         f"Trainer metadata   : {state_path}\n"
@@ -6289,6 +4458,10 @@ def load_two_layer_checkpoint_if_needed(
         "============================================================\n",
         flush=True,
     )
+
+    # ==========================================================
+    # 15. 返回 Trainer Resume State
+    # ==========================================================
 
     return (
         start_episode,
@@ -6331,7 +4504,7 @@ def build_run_log_paths(
     才能保证离线分析时可以一一匹配。
     """
 
-    run_start_time = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    run_start_time = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     episode_log_path = build_timestamped_log_path(
         base_log_path=(episode_base_log_path),
@@ -6355,21 +4528,26 @@ def append_csv_log(
 ) -> None:
     csv_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # 判断文件是否已经存在且不是空文件。
     write_header = not csv_path.exists() or csv_path.stat().st_size == 0
 
+    # 以追加模式打开文件。
     with csv_path.open(
         mode="a",
         newline="",
         encoding="utf-8-sig",
     ) as csv_file:
+        # 使用当前 row 的键作为固定列名。
         writer = csv.DictWriter(
             csv_file,
             fieldnames=list(row.keys()),
         )
 
+        # 新文件先写入表头。
         if write_header:
             writer.writeheader()
 
+        # 写入当前 episode 数据。
         writer.writerow(row)
         csv_file.flush()
         os.fsync(csv_file.fileno())
@@ -6393,7 +4571,7 @@ def build_episode_log_row(
     load_metrics: Dict[str, Any],
 ) -> Dict[str, Any]:
     """
-    构造 BCGH2-MASAC Episode-level CSV。
+    构造 MR-H-MASAC Episode-level CSV。
 
     Episode Log 只保存：
         - System outcome
@@ -6464,13 +4642,10 @@ def build_episode_log_row(
     remaining_waiting_jobs = int(count_waiting_jobs(env))
 
     host_alpha_values = [
-        float(host_agent.alpha.detach().cpu().item())
-        for host_agent in host_sac_agents.values()
+        float(host_agent.alpha.detach().cpu().item()) for host_agent in host_sac_agents.values()
     ]
 
-    host_alpha_mean = (
-        float(np.mean(host_alpha_values)) if host_alpha_values else float("nan")
-    )
+    host_alpha_mean = float(np.mean(host_alpha_values)) if host_alpha_values else float("nan")
 
     host_update_step_total = int(
         sum(int(host_agent.update_step) for host_agent in host_sac_agents.values())
@@ -6482,43 +4657,17 @@ def build_episode_log_row(
 
     neighbor_feedback_summary = neighbor_feedback_store.summary()
 
+    # ==========================================================
+    # Explicit Two-Level Log Columns
+    # ==============================================================
+
     row: Dict[str, Any] = {
+        # ------------------------------------------------------
+        # Run Identity
+        # ------------------------------------------------------
         "episode": int(stats.episode),
         "episode_seed": int(stats.episode_seed),
         "training_stage": str(stats.training_stage),
-        "bcgh2_bayesian_game_enabled": stats.bayesian_game_enabled,
-        "bcgh2_heuristic_guidance_enabled": bool(
-            stats.reward_shaping_enabled or stats.discount_reduction_enabled
-        ),
-        "bcgh2_beta": float(stats.heuristic_beta),
-        "bcgh2_original_gamma": float(stats.routing_gamma),
-        "bcgh2_effective_gamma": float(
-            stats.routing_gamma * stats.heuristic_beta
-            if stats.discount_reduction_enabled
-            else stats.routing_gamma
-        ),
-        "bcgh2_heuristic_reward_sum": float(stats.heuristic_reward_sum),
-        "bcgh2_modified_routing_reward_sum": float(
-            stats.routing_layer_reward_sum + stats.heuristic_reward_sum
-        ),
-        "bcgh2_nonterminal_score_mean": float(
-            stats.heuristic_score_sum / max(1, stats.heuristic_nonterminal_count)
-        ),
-        "bcgh2_nonterminal_score_count": int(stats.heuristic_nonterminal_count),
-        "bcgh2_score_coverage": (
-            float(stats.heuristic_valid_score_count / stats.heuristic_nonterminal_count)
-            if stats.heuristic_nonterminal_count
-            else float("nan")
-        ),
-        "bcgh2_nonterminal_edge_fraction": float(
-            stats.heuristic_nonterminal_count / max(1, stats.routing_edge_count)
-        ),
-        "bcgh2_reward_shaping_enabled": stats.reward_shaping_enabled,
-        "bcgh2_discount_reduction_enabled": stats.discount_reduction_enabled,
-        "bcgh_zero_diff_mode": bool(
-            not conf.BCGH_ENABLE_BAYESIAN_GAME
-            and not conf.BCGH_ENABLE_HEURISTIC_GUIDANCE
-        ),
         "cloud_enabled": bool(
             getattr(
                 env,
@@ -6526,27 +4675,59 @@ def build_episode_log_row(
                 False,
             )
         ),
-        "neighbor_feedback_collection_enabled": bool(
-            conf.COLLECT_NEIGHBOR_HISTORICAL_FEEDBACK
-        ),
-        "neighbor_feedback_decision_enabled": bool(
-            conf.USE_NEIGHBOR_HISTORICAL_FEEDBACK
-        ),
+        "neighbor_feedback_collection_enabled": bool(conf.COLLECT_NEIGHBOR_HISTORICAL_FEEDBACK),
+        "neighbor_feedback_decision_enabled": bool(conf.USE_NEIGHBOR_HISTORICAL_FEEDBACK),
+        # ------------------------------------------------------
+        # 当前 Episode 内，
+        # 有多少 terminal Job 被 Feedback Store 消费。
+        #
+        # 正常情况下最终应该接近本 Episode 的 total_jobs。
+        # ------------------------------------------------------
         "neighbor_feedback_episode_terminal_jobs_seen": int(
             neighbor_feedback_summary["episode_terminal_jobs_seen"]
         ),
+        # ------------------------------------------------------
+        # 当前 Episode 内真正产生多少条：
+        #
+        #   source Edge DC -> target Edge DC
+        #
+        # Historical Feedback Sample。
+        #
+        # 一个多跳 Job 可以产生多条 pair sample。
+        # ------------------------------------------------------
         "neighbor_feedback_episode_pair_samples": int(
             neighbor_feedback_summary["episode_pair_samples"]
         ),
+        # ------------------------------------------------------
+        # 从训练开始到当前 Episode，
+        # Feedback Store 一共消费了多少 terminal Job。
+        #
+        # 这是跨 Episode 累积值。
+        # ------------------------------------------------------
         "neighbor_feedback_total_terminal_jobs_seen": int(
             neighbor_feedback_summary["terminal_jobs_seen"]
         ),
+        # ------------------------------------------------------
+        # 从训练开始到当前 Episode，
+        # 一共形成了多少 source->target 历史样本。
+        #
+        # 同样是跨 Episode 累积值。
+        # ------------------------------------------------------
         "neighbor_feedback_total_pair_samples": int(
             neighbor_feedback_summary["total_pair_samples"]
         ),
-        "neighbor_feedback_active_pair_count": int(
-            neighbor_feedback_summary["active_pair_count"]
-        ),
+        # ------------------------------------------------------
+        # 当前已有历史数据的有向 pair 数量。
+        #
+        # 例如：
+        #
+        #   DC1 -> DC2
+        #   DC1 -> DC3
+        #   DC2 -> DC5
+        #
+        # 分别算 3 个 active pair。
+        # ------------------------------------------------------
+        "neighbor_feedback_active_pair_count": int(neighbor_feedback_summary["active_pair_count"]),
         "wall_time_seconds": float(wall_time_seconds),
         "simulation_end_time": float(
             getattr(
@@ -6555,6 +4736,11 @@ def build_episode_log_row(
                 0.0,
             )
         ),
+        # ------------------------------------------------------
+        # System Objective
+        #
+        # 不把 Host layer reward 再加一次。
+        # ------------------------------------------------------
         "training_episode_reward": float(stats.episode_return),
         "total_jobs": total_jobs,
         "completed_jobs": completed_jobs,
@@ -6581,17 +4767,21 @@ def build_episode_log_row(
         ),
         "max_waiting_queue_length": max_waiting_queue_length,
         "remaining_waiting_jobs": remaining_waiting_jobs,
+        # ------------------------------------------------------
+        # Reward / Energy Configuration
+        # ------------------------------------------------------
         "energy_normalization_j": float(conf.ENERGY_NORMALIZATION_J),
         "energy_cost_weight": float(conf.ENERGY_COST_WEIGHT),
         "energy_optimization_enabled": bool(float(conf.ENERGY_COST_WEIGHT) > 0.0),
+        # ------------------------------------------------------
+        # Routing Behavior
+        # ------------------------------------------------------
         "routing_decision_count": int(stats.routing_decision_count),
         "routing_actor_controlled_count": int(
             stats.routing_random_action_count + stats.routing_policy_action_count
         ),
         "routing_forced_action_count": int(stats.routing_forced_action_count),
-        "routing_orchestrator_action_count": int(
-            stats.routing_orchestrator_action_count
-        ),
+        "routing_orchestrator_action_count": int(stats.routing_orchestrator_action_count),
         "routing_random_action_count": int(stats.routing_random_action_count),
         "routing_policy_action_count": int(stats.routing_policy_action_count),
         "routing_self_count": int(stats.routing_self_count),
@@ -6624,35 +4814,6 @@ def build_episode_log_row(
             stats.terminal_trace_flushed_count,
         ),
         "max_routing_hops": int(stats.max_routing_hops),
-        "p95_routing_edge_hops": (
-            float(np.percentile(stats.routing_edge_hops_by_job, 95))
-            if stats.routing_edge_hops_by_job
-            else 0.0
-        ),
-        "first_edge_absorption_count": int(stats.first_edge_absorbed_count),
-        "first_edge_absorption_rate": safe_ratio(
-            stats.first_edge_absorbed_count, stats.first_edge_successor_total
-        ),
-        "edge_successor_total": int(stats.edge_successor_total),
-        "edge_target_absorption_count": int(stats.edge_successor_self_count),
-        "edge_target_absorption_rate": safe_ratio(
-            stats.edge_successor_self_count, stats.edge_successor_total
-        ),
-        "edge_to_edge_reforward_count": int(stats.edge_successor_edge_count),
-        "edge_to_edge_reforward_rate": safe_ratio(
-            stats.edge_successor_edge_count, stats.edge_successor_total
-        ),
-        "edge_to_cloud_transit_count": int(stats.edge_successor_cloud_count),
-        "edge_to_cloud_transit_rate": safe_ratio(
-            stats.edge_successor_cloud_count, stats.edge_successor_total
-        ),
-        "edge_target_drop_count": int(stats.edge_successor_drop_count),
-        "edge_target_drop_rate": safe_ratio(
-            stats.edge_successor_drop_count, stats.edge_successor_total
-        ),
-        "absorption_pair_counts_json": json.dumps(
-            stats.absorption_pair_counts, ensure_ascii=False, sort_keys=True
-        ),
         "routing_source_target_matrix_json": json.dumps(
             stats.routing_source_target_counts,
             ensure_ascii=False,
@@ -6663,6 +4824,9 @@ def build_episode_log_row(
             ensure_ascii=False,
             sort_keys=True,
         ),
+        # ------------------------------------------------------
+        # Host Behavior
+        # ------------------------------------------------------
         "host_decision_count": int(stats.host_decision_count),
         "host_random_action_count": int(stats.host_random_action_count),
         "host_policy_action_count": int(stats.host_policy_action_count),
@@ -6681,11 +4845,12 @@ def build_episode_log_row(
             stats.host_dropped_count,
             stats.host_decision_count,
         ),
+        # ------------------------------------------------------
+        # Routing MASAC Learning
+        # ------------------------------------------------------
         "routing_episode_updates": int(stats.routing_update_count),
         "routing_replay_size": int(len(routing_replay_buffer)),
-        "routing_replay_trainable_size": int(
-            routing_replay_buffer.num_trainable_actions
-        ),
+        "routing_replay_trainable_size": int(routing_replay_buffer.num_trainable_actions),
         "routing_update_step": int(routing_masac.update_step),
         "routing_global_decision_steps": int(global_decision_steps),
         "routing_training_action_steps": int(routing_normal_action_steps),
@@ -6695,22 +4860,20 @@ def build_episode_log_row(
         "routing_actor_loss": stats.mean_routing_metric("actor_loss"),
         "routing_alpha_loss": stats.mean_routing_metric("alpha_loss"),
         "routing_alpha": float(routing_masac.alpha.detach().cpu().item()),
+        "routing_alpha_min": min(float(a.alpha.detach().cpu()) for a in routing_masac.agents.values()),
+        "routing_alpha_max": max(float(a.alpha.detach().cpu()) for a in routing_masac.agents.values()),
+        "routing_parameter_count": sum(p.numel() for a in routing_masac.agents.values() for net in (a.actor, a.critic) for p in net.parameters()),
+        "scheduler": routing_masac.scheduler_name,
         "routing_policy_entropy": stats.mean_routing_metric("policy_entropy"),
         "routing_target_entropy": stats.mean_routing_metric("target_entropy"),
         "routing_mean_q1": stats.mean_routing_metric("mean_q1"),
         "routing_mean_q2": stats.mean_routing_metric("mean_q2"),
         "routing_mean_target_q": stats.mean_routing_metric("mean_target_q"),
-        "routing_heuristic_reward_mean": stats.mean_routing_metric(
-            "heuristic_reward_mean"
-        ),
-        "routing_modified_reward_mean": stats.mean_routing_metric(
-            "modified_reward_mean"
-        ),
-        "routing_raw_reward_mean": stats.mean_routing_metric("raw_reward_mean"),
+        # ------------------------------------------------------
+        # Host SAC Aggregate Learning
+        # ------------------------------------------------------
         "host_episode_updates": int(stats.host_update_count),
-        "host_replay_size_total": int(
-            sum(len(buffer) for buffer in host_replay_buffers.values())
-        ),
+        "host_replay_size_total": int(sum(len(buffer) for buffer in host_replay_buffers.values())),
         "host_training_action_steps_total": host_training_steps_total,
         "host_update_step_total": host_update_step_total,
         "host_critic_loss": stats.mean_host_metric("critic_loss"),
@@ -6724,8 +4887,18 @@ def build_episode_log_row(
         "host_mean_q1": stats.mean_host_metric("mean_q1"),
         "host_mean_q2": stats.mean_host_metric("mean_q2"),
         "host_mean_target_q": stats.mean_host_metric("mean_target_q"),
+        # ------------------------------------------------------
+        # Layer Reward Diagnostics
+        #
+        # 禁止做：
+        # system_episode_reward =
+        # routing_layer_reward_sum + host_layer_reward_sum
+        # ------------------------------------------------------
         "routing_layer_reward_sum": float(stats.routing_layer_reward_sum),
         "host_layer_reward_sum": float(stats.host_layer_reward_sum),
+        # ------------------------------------------------------
+        # Causal Trace Health
+        # ------------------------------------------------------
         "terminal_trace_flushed_count": int(stats.terminal_trace_flushed_count),
         "routing_transition_flushed_count": int(stats.routing_transition_flushed_count),
         "host_transition_flushed_count": int(stats.host_transition_flushed_count),
@@ -6734,10 +4907,19 @@ def build_episode_log_row(
         "causal_terminal_job_gap": int(total_jobs - stats.terminal_trace_flushed_count),
     }
 
+    # ==========================================================
+    # Existing System Metrics
+    #
+    # 这些属于真实 workload/service/load/energy，
+    # 与 Routing / Host 学习器无关，因此继续保留。
+    # ==============================================================
+
     row.update(service_metrics)
 
     row.update(energy_metrics)
 
+    # DC/Host 详细 JSON 移到 dc_log.csv。
+    # Episode Log 只保留 aggregate load metrics。
     for metric_name, metric_value in load_metrics.items():
 
         if metric_name in {
@@ -6752,6 +4934,8 @@ def build_episode_log_row(
 
 
 def build_dc_log_rows(
+    routing_masac: RoutingMASAC,
+    routing_replay_buffer: RoutingReplayBuffers,
     stats: EpisodeStatistics,
     env: Any,
     host_sac_agents: Dict[str, LocalHostSAC],
@@ -6761,7 +4945,7 @@ def build_dc_log_rows(
     neighbor_feedback_store: NeighborHistoricalFeedbackStore,
 ) -> list[Dict[str, Any]]:
     """
-    构造 BCGH2-MASAC DC-level 日志。
+    构造 MR-H-MASAC DC-level 日志。
 
     每个 Episode：
         每个 Edge DC 产生一行。
@@ -6835,10 +5019,16 @@ def build_dc_log_rows(
         )
 
         row = {
+            # --------------------------------------------------
+            # Identity
+            # --------------------------------------------------
             "episode": int(stats.episode),
             "episode_seed": int(stats.episode_seed),
             "training_stage": str(stats.training_stage),
             "dc_id": dc_id,
+            # --------------------------------------------------
+            # Exogenous Workload Arrival
+            # --------------------------------------------------
             "arrival_mode": str(
                 dc_load.get(
                     "arrival_mode",
@@ -6897,6 +5087,9 @@ def build_dc_log_rows(
                     0.0,
                 )
             ),
+            # --------------------------------------------------
+            # Routing Behavior
+            # --------------------------------------------------
             "routing_decisions": int(
                 dc_stats.get(
                     "routing_decisions",
@@ -6920,25 +5113,6 @@ def build_dc_log_rows(
                     "route_in_edge_count",
                     0,
                 )
-            ),
-            "incoming_edge_successor_count": int(
-                dc_stats.get("incoming_edge_successor_count", 0)
-            ),
-            "incoming_edge_absorbed_count": int(
-                dc_stats.get("incoming_edge_self_count", 0)
-            ),
-            "incoming_edge_absorption_rate": safe_ratio(
-                dc_stats.get("incoming_edge_self_count", 0),
-                dc_stats.get("incoming_edge_successor_count", 0),
-            ),
-            "incoming_edge_reforward_count": int(
-                dc_stats.get("incoming_edge_edge_count", 0)
-            ),
-            "incoming_edge_cloud_count": int(
-                dc_stats.get("incoming_edge_cloud_count", 0)
-            ),
-            "incoming_edge_drop_count": int(
-                dc_stats.get("incoming_edge_drop_count", 0)
             ),
             "net_edge_migration_count": int(
                 dc_stats.get(
@@ -6984,6 +5158,9 @@ def build_dc_log_rows(
                 ensure_ascii=False,
                 sort_keys=True,
             ),
+            # --------------------------------------------------
+            # Host Behavior
+            # --------------------------------------------------
             "host_decision_count": int(
                 dc_stats.get(
                     "host_decisions",
@@ -7020,6 +5197,9 @@ def build_dc_log_rows(
                     0,
                 )
             ),
+            # --------------------------------------------------
+            # Local Host SAC
+            # --------------------------------------------------
             "host_episode_updates": int(
                 dc_stats.get(
                     "host_updates",
@@ -7075,6 +5255,9 @@ def build_dc_log_rows(
                 "mean_target_q",
                 dc_id=dc_id,
             ),
+            # --------------------------------------------------
+            # DC Resource Load
+            # --------------------------------------------------
             "dc_completed_jobs": int(
                 dc_load.get(
                     "completed_jobs",
@@ -7135,12 +5318,28 @@ def build_dc_log_rows(
                     0.0,
                 )
             ),
+            # 当前 DC 每台 Host 的详细负载。
             "host_load_details_json": json.dumps(
                 dc_host_load_details,
                 ensure_ascii=False,
                 sort_keys=True,
             ),
         }
+
+        routing_agent = routing_masac.agents[dc_id]
+        routing_replay = routing_replay_buffer.buffers[dc_id]
+        row.update({
+            'scheduler': routing_masac.scheduler_name,
+            'routing_alpha': float(routing_agent.alpha.detach().cpu()),
+            'routing_action_steps': routing_masac.action_steps[dc_id],
+            'routing_update_step': routing_agent.update_step,
+            'routing_updates': stats.dc_counters.get(dc_id, {}).get('routing_updates', 0),
+            'routing_replay_size': len(routing_replay),
+            'routing_replay_capacity': routing_replay.capacity,
+        })
+        for name in UPDATE_TENSOR_METRIC_NAMES:
+            if name != 'alpha':
+                row[f'routing_{name}'] = stats.mean_dc_routing_metric(dc_id, name)
 
         rows.append(row)
 
@@ -7151,7 +5350,7 @@ def print_episode_summary(
     row: Dict[str, Any],
 ) -> None:
     """
-    打印 双层训练摘要。
+    打印 MR-H-MASAC 双层训练摘要。
 
     System / Routing / Host / Causal 分行显示，
     不再沿用单 MASAC 混合输出格式。
@@ -7280,183 +5479,4 @@ def print_episode_summary(
     )
 
 
-def evaluate_episode(
-    env,
-    routing_agent,
-    host_agents,
-    settings,
-    *,
-    seed=42,
-    deterministic=True,
-    diagnostic_scores=False,
-):
-    """Evaluate learned Actor with online feedback, without logit bias or updates."""
-    validate_bcgh_feature_config(settings)
-    routing_obs = RoutingObservationBuilder(
-        env,
-        use_neighbor_historical_feedback=settings.use_neighbor_historical_feedback,
-    )
-    routing_state = RoutingCentralizedStateBuilder(
-        env, routing_observation_builder=routing_obs
-    )
-    host_obs = HostObservationBuilder(env)
-    if (
-        routing_agent.local_obs_dim != routing_obs.obs_dim
-        or routing_agent.action_dim != env.action_dim
-    ):
-        raise ValueError("Loaded routing Actor does not match environment")
-    if (
-        routing_agent.global_state_dim != routing_state.state_dim
-        or routing_agent.num_agents != len(env.edge_dc_ids)
-    ):
-        raise ValueError("Loaded routing Critic does not match environment")
-    if set(host_agents) != set(env.edge_dc_ids):
-        raise ValueError("Loaded Host agents do not match edge DCs")
-    for dc_id, agent in host_agents.items():
-        if agent.obs_dim != host_obs.get_obs_dim(
-            dc_id
-        ) or agent.action_dim != host_obs.get_action_dim(dc_id):
-            raise ValueError(f"Host shape mismatch: {dc_id}")
-    structure = build_checkpoint_structure_metadata(env, routing_agent, host_agents)
-    if getattr(routing_agent, "environment_structure", structure) != structure:
-        raise ValueError("Evaluation topology/DC/Host order differs from training")
-    runtime = (
-        ShortWindowRuntime(build_short_window_game(env, settings))
-        if settings.enable_bayesian_game
-        else None
-    )
-    feedback = (
-        ShortWindowFeedbackStore(
-            env,
-            window_s=settings.short_window_s,
-            confidence_scale_samples=settings.bayesian_confidence_scale,
-        )
-        if runtime is not None
-        else NeighborHistoricalFeedbackStore(
-            env,
-            ewma_alpha=settings.neighbor_feedback_ewma_alpha,
-            age_scale_samples=settings.neighbor_feedback_age_scale_samples,
-            confidence_scale_samples=settings.neighbor_feedback_confidence_scale_samples,
-        )
-    )
-    routing_obs.set_neighbor_feedback_provider(feedback)
-    reward_values = {
-        f.name: getattr(conf, f.name.upper())
-        for f in fields(TrainingRewardConfig)
-        if hasattr(conf, f.name.upper())
-    }
-    reward_values.update(
-        max_latency_s=env.max_latency,
-        max_job_duration_s=env.max_job_duration,
-        sla_deadline_ratio=env.sla_deadline_ratio,
-        drop_deadline_ratio=env.drop_deadline_ratio,
-    )
-    reward = HMasacTrainingRewardModel(TrainingRewardConfig(**reward_values))
-    traces = PendingJobTraceStore()
-    score_settings = replace(
-        settings,
-        enable_heuristic_guidance=bool(
-            diagnostic_scores and settings.enable_heuristic_guidance
-        ),
-    )
-    scorer = RoutingStateHeuristic(
-        runtime, feedback, score_settings, env.routing_action_target_dc_ids
-    )
-    collector = TransitionCollector(
-        env,
-        routing_obs,
-        routing_state,
-        traces,
-        reward,
-        short_window_runtime=runtime,
-        state_heuristic=scorer,
-    )
-    env.reset(seed=seed)
-    routing_count = 0
-    decision = None
-
-    def finalize(trace):
-        if settings.collect_neighbor_historical_feedback:
-            feedback.update_from_finalized_trace(trace)
-        if runtime is not None:
-            for item in build_bayesian_evidence_from_finalized_trace(trace, env):
-                runtime.game.update_belief(item, update_clock=env.current_time)
-        traces.pop_finalized_trace(trace.job_id)
-
-    def consume_outcomes():
-        for event in env.pop_job_outcome_events():
-            traces.record_reward_event(
-                job_id=str(event["job_id"]),
-                env_time=float(event["env_time"]),
-                reward_delta=reward.calculate_outcome_reward(event),
-                reason=str(event["reason"]),
-                terminal=bool(event.get("terminal", False)),
-            )
-            if event.get("terminal", False):
-                finalize(traces.finalize_terminal_trace(str(event["job_id"])))
-
-    while env.agents:
-        if env.has_pending_host_decision():
-            ctx = env.get_pending_host_decision()
-            dc, job_id, now = (
-                str(ctx["dc_id"]),
-                str(ctx["job_id"]),
-                float(env.current_time),
-            )
-            obs = host_obs.build(dc_id=dc, job_id=job_id)
-            action = host_agents[dc].select_action(obs, deterministic=deterministic)
-            result = env.execute_pending_host_action(host_action=action)
-            traces.record_host_step(
-                job_id=job_id,
-                dc_id=dc,
-                env_time=now,
-                host_obs=obs,
-                action=action,
-                host_id=str(result["host_id"]),
-                action_source="policy",
-            )
-            traces.record_host_result(
-                job_id=job_id,
-                result=result["execution_result"],
-                env_time=float(result["env_time"]),
-            )
-            if runtime is not None:
-                runtime.record_host_result(
-                    job_id=job_id,
-                    dc_id=dc,
-                    execution_result=str(result["execution_result"]),
-                    now=float(result["env_time"]),
-                )
-            decision = None
-        elif collector.drain_one_dead_agent():
-            decision = None
-            continue
-        else:
-            if decision is None:
-                decision = collector.capture_decision()
-            if decision.forced_action is not None:
-                action, source = decision.forced_action, "forced"
-            else:
-                action = routing_agent.select_action(
-                    decision.local_obs,
-                    decision.agent_index,
-                    deterministic=deterministic,
-                )
-                source = "policy"
-            result, decision = collector.execute_and_record(
-                decision, action, action_source=source
-            )
-            routing_count += 1
-            if result.job_finalized:
-                finalize(traces.get_finalized_trace(result.job_id))
-        consume_outcomes()
-    consume_outcomes()
-    traces.assert_no_open_trace()
-    traces.assert_no_unflushed_finalized_trace()
-    return {
-        **calculate_service_metrics(env),
-        "routing_decisions": routing_count,
-        "actor_logit_bias": False,
-        "data_augmentation": False,
-        "absorption": runtime.absorption_summary() if runtime is not None else {},
-    }
+__all__ = [name for name in globals() if not name.startswith("__")]
