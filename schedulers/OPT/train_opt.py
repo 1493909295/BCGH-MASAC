@@ -24,6 +24,12 @@ from .routing_observation import RoutingObservationBuilder
 
 @dataclass(frozen=True)
 class TrainConfig(trainer.TrainConfig):
+    host_training_mode: str = "legacy"
+    host_checkpoint: str | None = None
+    num_episodes: int = conf.Episodes
+    host_pretrain_episodes: int = conf.HOST_PRETRAIN_EPISODES
+    routing_train_episodes: int = conf.ROUTING_TRAIN_EPISODES
+    joint_finetune_episodes: int = conf.JOINT_FINETUNE_EPISODES
     checkpoint_dir: str = conf.OPT_CHECKPOINT_DIR
     episode_log_csv_path: str = conf.OPT_EPISODE_LOG_CSV_PATH
     dc_log_csv_path: str = conf.OPT_DC_LOG_CSV_PATH

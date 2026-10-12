@@ -184,6 +184,11 @@ HOST_PRETRAIN_EPISODES = 300    # host训练轮数
 ROUTING_TRAIN_EPISODES = 500    # routing训练轮数
 JOINT_FINETUNE_EPISODES = (Episodes - HOST_PRETRAIN_EPISODES - ROUTING_TRAIN_EPISODES)      #合并训练
 
+# Five hierarchical schedulers now train Routing only against this immutable Host bundle.
+# The three legacy stage values above remain available to OPT.
+SHARED_HOST_CHECKPOINT = "model/shared_host/final"
+SCHEDULER_ROUTING_EPISODES = ROUTING_TRAIN_EPISODES
+
 
 
 # 奖励参数（先这样写着吧，目前没什么好办法
@@ -261,11 +266,21 @@ BCGH_ABSORPTION_POLICY_ACTIONS_ONLY = True
 BCGH_BENEFIT_SUCCESS_WEIGHT = 0.4     # 历史成功质量权重
 BCGH_BENEFIT_SLA_WEIGHT = 0.4         # SLA 满足质量权重
 BCGH_BENEFIT_DELAY_WEIGHT = 0.2       # 历史延迟质量权重
-BCGH_RISK_CONGESTION_COST_WEIGHT = 1.0  # C_j 在 Risk 中的权重
+BCGH_RISK_CONGESTION_COST_WEIGHT = 0.1  # C_j 在 Risk 中的权重
 BCGH_GUIDANCE_SCALE = 0.3             # Utility 转换为 logit bias 的尺度
 
 # 第 8 步：三阶段 Guidance λ 调度系数。
 # 实际 Bias = BCGH_GUIDANCE_SCALE × λ × centered_utility_bias。
-BCGH_GUIDANCE_LAMBDA_STAGE2_START = 1.0  # Routing Train 起始引导强度
-BCGH_GUIDANCE_LAMBDA_STAGE2_PEAK = 1.0   # Routing Train 结束/Joint 起始
-BCGH_GUIDANCE_LAMBDA_STAGE3_END = 1.0    # Joint Finetune 结束及评估引导强度
+BCGH_GUIDANCE_LAMBDA_STAGE2_START = 0.3  # 长期固定非零引导；三个阶段系数保持相同
+BCGH_GUIDANCE_LAMBDA_STAGE2_PEAK = 0.3   # Routing Train 结束/Joint 起始
+BCGH_GUIDANCE_LAMBDA_STAGE3_END = 0.3    # Joint Finetune 结束及评估引导强度
+
+# 对称终局评分；保留弱拥塞边际成本和已知路径风险，legacy 用于旧公式消融。
+BCGH_SCORING_MODE = "symmetric"
+BCGH_RESOURCE_PENALTY_ENABLED = True
+BCGH_TRANSIT_PENALTY_ENABLED = True
+BCGH_GUIDANCE_LOG_EVERY = 100
+# Unknown residence prior and explicit background capacity fractions (no remote live telemetry).
+BCGH_PRESSURE_RESIDENCE_S = 300.0
+BCGH_PRESSURE_BACKGROUND_CPU = 0.0
+BCGH_PRESSURE_BACKGROUND_GPU = 0.0

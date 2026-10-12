@@ -1323,8 +1323,10 @@ ENVIRONMENT_DIR = PROJECT_ROOT / "environment"
 
 @dataclass(frozen=True)
 class TrainConfig:
+    host_checkpoint: Optional[str] = conf.SHARED_HOST_CHECKPOINT
+    host_training_mode: str = "frozen"
 
-    num_episodes: int = conf.Episodes
+    num_episodes: int = conf.SCHEDULER_ROUTING_EPISODES
 
     # System-wide budget; optional per-DC override explicitly increases total capacity.
     routing_replay_capacity: int = conf.MR_H_MASAC_ROUTING_REPLAY_TOTAL_CAPACITY
@@ -1343,9 +1345,9 @@ class TrainConfig:
     host_updates_per_train: int = conf.HOST_UPDATES_PER_TRAIN
 
     # Three-stage training
-    host_pretrain_episodes: int = conf.HOST_PRETRAIN_EPISODES
-    routing_train_episodes: int = conf.ROUTING_TRAIN_EPISODES
-    joint_finetune_episodes: int = conf.JOINT_FINETUNE_EPISODES
+    host_pretrain_episodes: int = 0
+    routing_train_episodes: int = conf.SCHEDULER_ROUTING_EPISODES
+    joint_finetune_episodes: int = 0
     log_interval: int = conf.Log_interval
     checkpoint_interval: int = conf.Checkpoint_Interval  # 兼容旧调用，双层训练不按间隔保存
     seed: int = conf.Seed
@@ -3923,6 +3925,9 @@ def save_two_layer_checkpoint(
     if routing_masac.observation_metadata is not None:
         checkpoint_metadata["scheduler_config"] = asdict(train_config)
 
+    if shared_host_mode(train_config):
+        checkpoint_metadata["shared_host"] = host_reference(host_sac_agents)
+
     state_path = checkpoint_state_path(model_path)
 
     atomic_checkpoint_text_write(
@@ -3987,6 +3992,8 @@ def load_two_layer_checkpoint_if_needed(
         host_training_action_steps
         best_episode_return
     """
+
+    validate_scheduler_resume(resume_checkpoint, host_sac_agents, train_config)
 
     # ==========================================================
     # 默认 Host Training Step
@@ -5478,5 +5485,12 @@ def print_episode_summary(
         f"{float(row['system_total_equivalent_avg_power_w']):10.2f} W"
     )
 
+
+# Canonical Host contract shared by all five schedulers.
+from schedulers.shared_host import (
+    HostSACConfig, LocalHostSAC, HostObservationBuilder, FrozenHostReplay,
+    shared_host_mode, prepare_scheduler_config, load_frozen_hosts,
+    host_reference, validate_scheduler_resume, add_host_log_identity,
+)
 
 __all__ = [name for name in globals() if not name.startswith("__")]

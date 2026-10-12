@@ -3156,8 +3156,10 @@ ENVIRONMENT_DIR = PROJECT_ROOT / "environment"
 
 @dataclass(frozen=True)
 class TrainConfig:
+    host_checkpoint: Optional[str] = conf.SHARED_HOST_CHECKPOINT
+    host_training_mode: str = "frozen"
 
-    num_episodes: int = conf.Episodes
+    num_episodes: int = conf.SCHEDULER_ROUTING_EPISODES
 
     routing_replay_capacity: int = conf.ROUTING_REPLAY_CAPACITY
     host_replay_capacity: int = conf.HOST_REPLAY_CAPACITY
@@ -3173,9 +3175,9 @@ class TrainConfig:
     host_train_every: int = conf.HOST_TRAIN_EVERY
     host_updates_per_train: int = conf.HOST_UPDATES_PER_TRAIN
 
-    host_pretrain_episodes: int = conf.HOST_PRETRAIN_EPISODES
-    routing_train_episodes: int = conf.ROUTING_TRAIN_EPISODES
-    joint_finetune_episodes: int = conf.JOINT_FINETUNE_EPISODES
+    host_pretrain_episodes: int = 0
+    routing_train_episodes: int = conf.SCHEDULER_ROUTING_EPISODES
+    joint_finetune_episodes: int = 0
     log_interval: int = conf.Log_interval
     checkpoint_interval: int = (
         conf.Checkpoint_Interval
@@ -5918,6 +5920,9 @@ def save_two_layer_checkpoint(
         },
     }
 
+    if shared_host_mode(train_config):
+        checkpoint_metadata["shared_host"] = host_reference(host_sac_agents)
+
     state_path = checkpoint_state_path(model_path)
 
     atomic_checkpoint_text_write(
@@ -5982,6 +5987,8 @@ def load_two_layer_checkpoint_if_needed(
         host_training_action_steps
         best_episode_return
     """
+
+    validate_scheduler_resume(resume_checkpoint, host_sac_agents, train_config)
 
     default_host_steps = {str(dc_id): 0 for dc_id in host_sac_agents.keys()}
 
@@ -7291,6 +7298,8 @@ def evaluate_episode(
     diagnostic_scores=False,
 ):
     """Evaluate learned Actor with online feedback, without logit bias or updates."""
+
+    validate_frozen_host_context(env, host_agents, settings)
     validate_bcgh_feature_config(settings)
     routing_obs = RoutingObservationBuilder(
         env,
@@ -7404,7 +7413,7 @@ def evaluate_episode(
                 float(env.current_time),
             )
             obs = host_obs.build(dc_id=dc, job_id=job_id)
-            action = host_agents[dc].select_action(obs, deterministic=deterministic)
+            action = host_agents[dc].select_action(obs, deterministic=True if shared_host_mode(settings) else deterministic)
             result = env.execute_pending_host_action(host_action=action)
             traces.record_host_step(
                 job_id=job_id,
@@ -7460,3 +7469,11 @@ def evaluate_episode(
         "data_augmentation": False,
         "absorption": runtime.absorption_summary() if runtime is not None else {},
     }
+
+
+# Canonical Host contract shared by all five schedulers.
+from schedulers.shared_host import (
+    HostSACConfig, LocalHostSAC, HostObservationBuilder, FrozenHostReplay,
+    shared_host_mode, prepare_scheduler_config, load_frozen_hosts,
+    host_reference, validate_scheduler_resume, add_host_log_identity, validate_frozen_host_context,
+)

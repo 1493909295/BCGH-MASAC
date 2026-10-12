@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 import numpy as np
+from schedulers.congestion_guidance import GUIDANCE_CONTEXT_VERSION, copy_guidance_array, validate_replay_guidance
 from numpy.typing import NDArray
 
 # Transition records
@@ -165,6 +166,11 @@ class RoutingTransition:
     done: bool
 
     terminal_reason: Optional[str]
+    guidance_context_version: int = GUIDANCE_CONTEXT_VERSION
+    guidance_offsets: Optional[np.ndarray] = None
+    guidance_mask: Optional[np.ndarray] = None
+    next_guidance_offsets: Optional[np.ndarray] = None
+    next_guidance_mask: Optional[np.ndarray] = None
 
 
 # Replay storage
@@ -410,6 +416,11 @@ class RoutingReplayBatch:
     # 正式 RoutingReplayBuffer 不保存 forced transition，
     # 因此这里永远为 False。
     is_forced_action: np.ndarray
+    guidance_context_version: int = GUIDANCE_CONTEXT_VERSION
+    guidance_offsets: Optional[np.ndarray] = None
+    guidance_mask: Optional[np.ndarray] = None
+    next_guidance_offsets: Optional[np.ndarray] = None
+    next_guidance_mask: Optional[np.ndarray] = None
 
 
 class RoutingReplayBuffer:
@@ -432,8 +443,11 @@ class RoutingReplayBuffer:
         local_obs_dim: int,
         global_state_dim: int,
         seed: Optional[int] = None,
+        require_guidance: bool = False,
     ) -> None:
 
+        self.require_guidance = bool(require_guidance)
+        self._guidance_mode = None
         self.capacity = int(capacity)
 
         self.local_obs_dim = int(local_obs_dim)
@@ -481,6 +495,9 @@ class RoutingReplayBuffer:
             (self.capacity,),
             dtype=np.float32,
         )
+
+        self.guidance_offsets = self.guidance_mask = None
+        self.next_guidance_offsets = self.next_guidance_mask = None
 
         self.next_agent_indices = np.full(
             (self.capacity,),
@@ -554,6 +571,19 @@ class RoutingReplayBuffer:
                 f"job={transition.job_id}"
             )
 
+        guided = validate_replay_guidance(transition, required=self.require_guidance)
+        if self._guidance_mode is not None and self._guidance_mode != guided:
+            raise ValueError("Cannot mix guided and unguided replay records")
+        contexts = [getattr(transition, key, None) for key in ('guidance_offsets', 'guidance_mask', 'next_guidance_offsets', 'next_guidance_mask')]
+        shapes = {np.asarray(value).shape for value in contexts if value is not None}
+        if len(shapes) > 1 or any(len(shape) != 1 or shape[0] < 1 for shape in shapes):
+            raise ValueError('Routing guidance snapshots must have one identical action dimension')
+        if self.guidance_offsets is not None and shapes and shapes != {(self.guidance_offsets.shape[1],)}:
+            raise ValueError('Replay guidance action dimension changed')
+        for key, value in zip(('guidance_offsets', 'guidance_mask', 'next_guidance_offsets', 'next_guidance_mask'), contexts):
+            if value is not None and (not np.isfinite(value).all() or ('mask' in key and not np.asarray(value).any())):
+                raise ValueError('Nonfinite guidance or empty action mask')
+
         local_obs = np.asarray(
             transition.local_obs,
             dtype=np.float32,
@@ -592,6 +622,19 @@ class RoutingReplayBuffer:
 
         self.rewards[index] = float(transition.reward)
 
+        context = getattr(transition, 'guidance_offsets', None)
+        if context is None:
+            context = getattr(transition, 'next_guidance_offsets', None)
+        if context is not None and self.guidance_offsets is None:
+            dim = len(context)
+            self.guidance_offsets = np.zeros((self.capacity, dim), dtype=np.float32)
+            self.next_guidance_offsets = np.zeros((self.capacity, dim), dtype=np.float32)
+            self.guidance_mask = np.ones((self.capacity, dim), dtype=np.bool_)
+            self.next_guidance_mask = np.ones((self.capacity, dim), dtype=np.bool_)
+        if self.guidance_offsets is not None:
+            for name in ('guidance_offsets', 'guidance_mask', 'next_guidance_offsets', 'next_guidance_mask'):
+                value = getattr(transition, name, None)
+                getattr(self, name)[index] = value if value is not None else ('mask' in name)
         self.next_agent_indices[index] = int(transition.next_agent_index)
 
         self.next_local_obs[index] = next_local_obs
@@ -604,6 +647,7 @@ class RoutingReplayBuffer:
 
         self.done[index] = bool(transition.done)
 
+        self._guidance_mode = guided
         self._position = (self._position + 1) % self.capacity
 
         self._size = min(
@@ -649,6 +693,10 @@ class RoutingReplayBuffer:
         )
 
         return RoutingReplayBatch(
+            guidance_offsets=None if self.guidance_offsets is None else self.guidance_offsets[indices].copy(),
+            guidance_mask=None if self.guidance_mask is None else self.guidance_mask[indices].copy(),
+            next_guidance_offsets=None if self.next_guidance_offsets is None else self.next_guidance_offsets[indices].copy(),
+            next_guidance_mask=None if self.next_guidance_mask is None else self.next_guidance_mask[indices].copy(),
             agent_indices=(self.agent_indices[indices].copy()),
             local_obs=(self.local_obs[indices].copy()),
             global_states=(self.global_states[indices].copy()),
@@ -673,6 +721,9 @@ class RoutingReplayBuffer:
         self._position = 0
         self._size = 0
         self.total_added = 0
+        self._guidance_mode = None
+        self.guidance_offsets = self.guidance_mask = None
+        self.next_guidance_offsets = self.next_guidance_mask = None
 
 
 # Pending causal traces
@@ -711,6 +762,8 @@ class PendingRoutingStep:
     next_global_state: Optional[FloatArray] = None
 
     successor_resolved: bool = False
+    guidance_offsets: Optional[np.ndarray] = None
+    guidance_mask: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -2101,6 +2154,10 @@ class PendingJobTraceStore:
                     action_type=str(step.action_type),
                     action_source=str(step.action_source),
                     reward=float(final_rewards[step_index]),
+                    guidance_offsets=copy_guidance_array(step.guidance_offsets),
+                    guidance_mask=copy_guidance_array(step.guidance_mask, mask=True),
+                    next_guidance_offsets=copy_guidance_array(next_raw_step.guidance_offsets) if has_normal_routing_successor else None,
+                    next_guidance_mask=copy_guidance_array(next_raw_step.guidance_mask, mask=True) if has_normal_routing_successor else None,
                     next_agent_id=(next_agent_id),
                     next_agent_index=(next_agent_index),
                     next_env_time=(next_env_time),

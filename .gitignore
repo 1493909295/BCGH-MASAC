@@ -26,6 +26,7 @@ checkpoint/
 *.pth
 *.ckpt
 *.trainer.json
+/model/shared_host*/
 
 # Temporary/intermediate files produced by atomic checkpoint writes or jobs
 *.tmp
@@ -41,6 +42,15 @@ checkpoint/
 /MYENV1-linux.tar.gz
 /tests/*
 !/tests/test_mr_bcgh_masac.py
+!/tests/host_test_support.py
+!/tests/test_shared_host.py
+!/tests/test_mr_h_masac.py
+!/tests/test_bcgh2_masac.py
+!/tests/test_bcgh_short_window.py
+!/tests/test_guidance_scoring.py
+!/tests/test_congestion_guidance_v5.py
+!/tests/test_permanent_guidance.py
+!/tests/test_opt_scheduler.py
 /tmp/
 /doc/
 /docs/*
@@ -89,3 +99,6 @@ dist/
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Local scratch runs for the v5 congestion-guidance regression suite.
+/_pytest_guidance_v5*/

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from .guided_policy import SymmetricGuidanceMixin, TerminalOutcomeStore
+
 import json
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
+from schedulers.congestion_guidance import ActivePressureMixin, TransferLifecycle
 from pathlib import Path
 from typing import Mapping
 
@@ -63,6 +66,9 @@ class RoutingActionFeatures:
     cpu_request: float = 0.0
     gpu_request: float = 0.0
     source_signal: LocalSourceSignal = LocalSourceSignal()
+    path_cost: float = 0.0
+    cycle_risk: float = 0.0
+    expected_service_s: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -99,6 +105,18 @@ class ActionUtilityBreakdown:
     absorption_resource_class: str = ""
     transit_penalty_raw: float = 0.0
     transit_penalty: float = 0.0
+    applied_resource_cost: float = 0.0
+    applied_transit_penalty: float = 0.0
+    effective_probability: float = 0.5
+    success_score: float = 0.5
+    sla_score: float = 0.5
+    delay_score: float = 0.5
+    delay_known: bool = False
+    feedback_age_s: float | None = None
+    terminal_class_samples: int = 0
+    terminal_class_mix: float = 0.0
+    admitted_terminal_samples: int = 0
+    effective_local_completion_rate: float | None = None
 
 
 @dataclass
@@ -118,7 +136,7 @@ class BetaBeliefState:
         )
 
 
-ABSORPTION_OUTCOMES = ("self", "edge", "cloud", "drop")
+ABSORPTION_OUTCOMES = ("started", "queued", "edge", "cloud", "drop")
 
 
 @dataclass(frozen=True)
@@ -185,9 +203,12 @@ class ShortWindowAbsorptionStore:
         self.edge_dc_ids = tuple(map(str, edge_dc_ids))
         self.capacities = dict(capacities)
         self.window_s = positive(window_s, "absorption window")
-        priors = priors or {name: 1.0 for name in ABSORPTION_OUTCOMES}
+        priors = priors or dict(started=0.5, queued=0.5, edge=1.0, cloud=1.0, drop=1.0)
+        if "self" in priors:
+            priors = {**priors, "started": priors["self"] / 2, "queued": priors["self"] / 2}
+            del priors["self"]
         if set(priors) != set(ABSORPTION_OUTCOMES):
-            raise ValueError("Absorption priors must cover self/edge/cloud/drop")
+            raise ValueError("Successor priors must cover started/queued/edge/cloud/drop")
         self.priors = {
             name: positive(priors[name], f"{name} prior") for name in ABSORPTION_OUTCOMES
         }
@@ -296,7 +317,7 @@ class ShortWindowAbsorptionStore:
         }
         confidence = pair_n / (pair_n + self.confidence_scale)
         return AbsorptionBeliefState(
-            p_absorb=probabilities["self"],
+            p_absorb=probabilities["started"] + probabilities["queued"],
             p_edge=probabilities["edge"],
             p_cloud=probabilities["cloud"],
             p_drop=probabilities["drop"],
@@ -329,7 +350,7 @@ class ShortWindowAbsorptionStore:
             "pair_counts": {key: dict(value) for key, value in self._episode_pair_counts.items()},
             "edge_to_cloud_transit_rate": (self._episode_counts["cloud"] / total if total else 0.0),
             "edge_to_edge_reforward_rate": (self._episode_counts["edge"] / total if total else 0.0),
-            "edge_target_absorption_rate": (self._episode_counts["self"] / total if total else 0.0),
+            "edge_target_absorption_rate": ((self._episode_counts["started"] + self._episode_counts["queued"]) / total if total else 0.0),
         }
 
 
@@ -500,12 +521,19 @@ class HistoricalPressureStore:
         }
 
 
-class BayesianCongestionGame:
+class ActivePressureStore(ActivePressureMixin, HistoricalPressureStore):
+    pass
+
+
+class BayesianCongestionGame(SymmetricGuidanceMixin):
     def __init__(
         self,
         game_definition,
         *,
         capacities,
+        scoring_mode="symmetric",
+        resource_penalty_enabled=False,
+        transit_penalty_enabled=False,
         prior_alpha=1.0,
         prior_beta=1.0,
         confidence_scale=20.0,
@@ -533,7 +561,18 @@ class BayesianCongestionGame:
         absorption_demand_thresholds=(0.25, 0.60),
         absorption_class_confidence_scale=4.0,
         absorption_policy_actions_only=True,
+        pressure_residence_s=300.0,
+        pressure_background_cpu=0.0,
+        pressure_background_gpu=0.0,
     ):
+        if scoring_mode not in {"symmetric", "legacy"}:
+            raise ValueError("Unknown guidance scoring mode")
+        self.scoring_mode = scoring_mode
+        self.resource_penalty_enabled = bool(resource_penalty_enabled)
+        self.transit_penalty_enabled = bool(transit_penalty_enabled)
+        self.outcome_store = TerminalOutcomeStore(window_s, confidence_scale, prior_alpha, prior_beta)
+        self.completion_time_scale = 1.0
+        self._audited_terminal_jobs = set()
         self.game_definition = game_definition
         if set(capacities) != set(game_definition.player_ids):
             raise ValueError("Static capacities must cover exactly the edge players")
@@ -544,7 +583,7 @@ class BayesianCongestionGame:
             confidence_scale=confidence_scale,
             window_s=window_s,
         )
-        self.pressure_store = HistoricalPressureStore(
+        self.pressure_store = (HistoricalPressureStore if scoring_mode == "legacy" else ActivePressureStore)(
             capacities,
             window_s=window_s,
             linear_cost_weight=linear_cost_weight,
@@ -552,6 +591,9 @@ class BayesianCongestionGame:
             cpu_weight=cpu_weight,
             gpu_weight=gpu_weight,
         )
+        self.pressure_store.initial_residence_s = positive(pressure_residence_s, "pressure residence")
+        self.pressure_store.background_cpu = positive(pressure_background_cpu, "background CPU", zero=True)
+        self.pressure_store.background_gpu = positive(pressure_background_gpu, "background GPU", zero=True)
         self.absorption_enabled = bool(absorption_enabled)
         self.absorption_policy_actions_only = bool(absorption_policy_actions_only)
         self.absorption_store = ShortWindowAbsorptionStore(
@@ -587,11 +629,14 @@ class BayesianCongestionGame:
         self.belief_store.reset()
         self.pressure_store.reset()
         self.absorption_store.reset()
+        self.outcome_store.reset()
+        self._audited_terminal_jobs.clear()
 
     def advance_time(self, now):
         self.belief_store.advance_time(now)
         self.pressure_store.advance_time(now)
         self.absorption_store.advance_time(now)
+        self.outcome_store.advance_time(now)
 
     def update_belief(self, evidence, *, update_clock=None):
         return self.belief_store.update(evidence, update_clock=update_clock)
@@ -609,10 +654,14 @@ class BayesianCongestionGame:
     def get_absorption_belief(self, source_dc_id, target_dc_id, cpu_request=0.0, gpu_request=0.0):
         return self.absorption_store.belief(source_dc_id, target_dc_id, cpu_request, gpu_request)
 
-    def get_pressure(self, target_dc_id):
+    def get_pressure(self, target_dc_id, *, local=False):
+        if isinstance(self.pressure_store, ActivePressureStore):
+            return self.pressure_store.get_pressure(target_dc_id, include_local=local)
         return self.pressure_store.get_pressure(target_dc_id)
 
-    def get_congestion_cost(self, target_dc_id, cpu_request=0.0, gpu_request=0.0):
+    def get_congestion_cost(self, target_dc_id, cpu_request=0.0, gpu_request=0.0, *, local=False, service_s=None):
+        if isinstance(self.pressure_store, ActivePressureStore):
+            return self.pressure_store.get_congestion_cost(target_dc_id, cpu_request, gpu_request, include_local=local, service_s=service_s)
         return self.pressure_store.get_congestion_cost(target_dc_id, cpu_request, gpu_request)
 
     def calculate_benefit(self, action):
@@ -621,7 +670,7 @@ class BayesianCongestionGame:
             raise ValueError("Quality scores must lie in [0,1]")
         return sum(w * v for w, v in zip(self.benefit_weights, values))
 
-    def evaluate_actions(self, source_dc_id, job_context):
+    def _evaluate_legacy_actions(self, source_dc_id, job_context):
         if not job_context:
             raise ValueError("No candidate actions")
         rows = []
@@ -741,6 +790,12 @@ def build_short_window_game(env, settings, definition=None):
     return BayesianCongestionGame(
         definition,
         capacities=build_static_capacities(env),
+        pressure_residence_s=settings.pressure_residence_s,
+        pressure_background_cpu=settings.pressure_background_cpu,
+        pressure_background_gpu=settings.pressure_background_gpu,
+        scoring_mode=settings.scoring_mode,
+        resource_penalty_enabled=settings.resource_penalty_enabled,
+        transit_penalty_enabled=settings.transit_penalty_enabled,
         prior_alpha=settings.bayesian_prior_alpha,
         prior_beta=settings.bayesian_prior_beta,
         confidence_scale=settings.bayesian_confidence_scale,
@@ -815,6 +870,7 @@ class ShortWindowRuntime:
     def __init__(self, game):
         self.game = game
         self.policy_actions_only = bool(game.absorption_policy_actions_only)
+        self.game.lifecycle_runtime = self
         self.reset()
 
     def reset(self):
@@ -824,13 +880,20 @@ class ShortWindowRuntime:
         self._pending_self = {}
         self._receipts = {i: {} for i in self.game.game_definition.player_ids}
         self._sequence = 0
+        self.lifecycle = TransferLifecycle()
+        self._job_pressure = {}
+        self._visited = {}
+        self._routing_sequences = {}
 
     def record_routing(self, decision, action_type, target_dc_id, action_source, job):
         """Called after env.step succeeded, before building the next observation."""
         action_type = str(action_type)
         action_source = str(action_source)
         job_id = str(decision.job_id)
+        sequence_index = self._routing_sequences.get(job_id, 0)
+        self._routing_sequences[job_id] = sequence_index + 1
         self.game.advance_time(decision.env_time)
+        self._visited.setdefault(job_id, set()).add(str(decision.agent_id))
 
         predecessor = self._pending_absorption.pop(job_id, None)
         if predecessor is not None:
@@ -839,6 +902,9 @@ class ShortWindowRuntime:
             if action_type == "self":
                 self._pending_self[job_id] = (predecessor, float(decision.env_time), action_source)
             else:
+                release = getattr(self.game.pressure_store, "release", None)
+                if release is not None:
+                    release(predecessor.event_id, decision.env_time)
                 outcome = {"edge_dc": "edge", "cloud": "cloud", "drop": "drop"}.get(action_type)
                 if outcome is None:
                     raise RuntimeError(f"Unknown absorption successor action: {action_type}")
@@ -849,10 +915,19 @@ class ShortWindowRuntime:
                     successor_action_source=action_source,
                 )
 
+        if action_type == "self" and predecessor is None:
+            key = f"{job_id}:local"
+            self.game.pressure_store.record_selection(str(decision.agent_id), event_id=key,
+                event_time=decision.env_time, cpu_request=job.cpu_request, gpu_request=job.gpu_request)
+            if hasattr(self.game.pressure_store, 'mark_local'):
+                self.game.pressure_store.mark_local(key)
+            if hasattr(self.game.pressure_store, "set_service_hint") and hasattr(job, "duration"):
+                self.game.pressure_store.set_service_hint(key, float(job.duration))
+            self._job_pressure.setdefault(job_id, set()).add(key)
         if action_type != "edge_dc":
             return
         self._sequence += 1
-        event_id = f"{job_id}:{self._sequence}"
+        event_id = f"{job_id}:{sequence_index}"
         self.game.update_pressure(
             decision.agent_id,
             target_dc_id,
@@ -871,10 +946,14 @@ class ShortWindowRuntime:
             gpu_request=float(job.gpu_request),
             predecessor_action_source=action_source,
         )
+        if hasattr(self.game.pressure_store, "set_service_hint") and hasattr(job, "duration"):
+            self.game.pressure_store.set_service_hint(event_id, float(job.duration))
+        self.lifecycle.register(pending)
+        self._job_pressure.setdefault(job_id, set()).add(event_id)
         self._pending_arrivals[job_id] = pending
         self._pending_absorption[job_id] = pending
 
-    def _record_absorption(self, pending, outcome, *, observed_at, successor_action_source):
+    def _record_absorption(self, pending, outcome, *, observed_at, successor_action_source, effective_at=None):
         informative = not self.policy_actions_only or (
             pending.predecessor_action_source == "policy"
             and str(successor_action_source) == "policy"
@@ -882,6 +961,7 @@ class ShortWindowRuntime:
         resource_class = self.game.absorption_store.resource_class(
             pending.target_dc_id, pending.cpu_request, pending.gpu_request
         )
+        self.lifecycle.successor(pending.event_id, outcome, observed_at if effective_at is None else effective_at)
         return self.game.record_absorption(
             AbsorptionEvidence(
                 event_id=pending.event_id,
@@ -912,11 +992,12 @@ class ShortWindowRuntime:
         execution_result = str(execution_result)
         if execution_result not in {"started", "queued", "dropped"}:
             raise ValueError(f"Unknown host execution result: {execution_result}")
-        outcome = "self" if execution_result in {"started", "queued"} else "drop"
+        outcome = execution_result if execution_result in {"started", "queued"} else "drop"
         return self._record_absorption(
             pending,
             outcome,
             observed_at=max(float(observed_at), float(now)),
+            effective_at=float(observed_at),
             successor_action_source=successor_action_source,
         )
 
@@ -977,7 +1058,7 @@ class ShortWindowRuntime:
             decision.agent_id, env.dc_map[decision.agent_id], decision.env_time
         )
         job = env.job_map[decision.job_id]
-        return policy.build_action_context(
+        context = policy.build_action_context(
             decision.agent_id,
             feedback_provider,
             cpu_request=job.cpu_request,
@@ -985,5 +1066,37 @@ class ShortWindowRuntime:
             source_signals=signals,
         )
 
+        # Only local link metadata and this task's known path are used.
+        visited = self._visited.get(str(decision.job_id), set())
+        deadline = max(float(job.arrive_time) + float(env.sla_deadline_ratio) * float(job.duration) - float(decision.env_time), 1.0)
+        for target, features in tuple(context.items()):
+            latency = 0.0
+            if target != decision.agent_id and env.graph is not None and env.graph.has_edge(decision.agent_id, target):
+                latency = max(float(env.graph[decision.agent_id][target].get("weight", 0.0)), 0.0)
+            context[target] = replace(features, path_cost=latency / deadline,
+                                      expected_service_s=float(job.duration),
+                                      cycle_risk=float(target != decision.agent_id and target in visited))
+        return context
+
+    def consume_service_events(self, env):
+        for event in env.pop_job_service_events():
+            self.lifecycle.start(event['job_id'], event['dc_id'], event['env_time'])
+            store = self.game.pressure_store
+            if hasattr(store, 'mark_started'):
+                for key in self._job_pressure.get(str(event['job_id']), ()):
+                    store.mark_started(key, event['env_time'], str(event['dc_id']))
+
+    def record_terminal(self, trace, job, sla):
+        pending = self._pending_absorption.pop(str(trace.job_id), None)
+        if pending is not None:
+            self._record_absorption(pending, 'drop', observed_at=float(trace.terminal_time), successor_action_source='forced')
+        self.lifecycle.close(trace, job, sla)
+        release = getattr(self.game.pressure_store, "release", None)
+        if release is not None:
+            for key in self._job_pressure.pop(str(trace.job_id), ()):
+                release(key, self.game.outcome_store.now)
+        self._visited.pop(str(trace.job_id), None)
+        self._routing_sequences.pop(str(trace.job_id), None)
+
     def absorption_summary(self):
-        return self.game.absorption_store.episode_summary()
+        return {**self.game.absorption_store.episode_summary(), **self.lifecycle.metrics()}

@@ -18,6 +18,9 @@ from torch import nn
 from torch.nn import functional as F
 
 import config as conf
+from schedulers.congestion_guidance import (
+    GUIDANCE_CONTEXT_VERSION, GuidanceConditioner, guided_distribution, guidance_tensor,
+)
 
 from .experience import HostReplayBatch, HostReplayBuffer, RoutingReplayBatch, RoutingReplayBuffer
 
@@ -39,6 +42,7 @@ class RoutingDiscreteActor(nn.Module):
         super().__init__()
         self.local_obs_dim = int(local_obs_dim)
         self.action_dim = int(action_dim)
+        self.guidance_context = GuidanceConditioner(action_dim, hidden_dim)
         self.fc1 = nn.Linear(self.local_obs_dim, int(hidden_dim))
         self.fc2 = nn.Linear(int(hidden_dim), int(hidden_dim))
         self.output_layer = nn.Linear(int(hidden_dim), self.action_dim)
@@ -46,16 +50,17 @@ class RoutingDiscreteActor(nn.Module):
         initialize_linear_layer(self.fc2, nn.init.calculate_gain("relu"))
         initialize_linear_layer(self.output_layer, conf.ROUTING_ACTOR_GAIN)
 
-    def forward(self, local_obs, agent_indices=None):
-        return self.output_layer(F.relu(self.fc2(F.relu(self.fc1(local_obs)))))
+    def forward(self, local_obs, agent_indices=None, guidance_offsets=None, guidance_mask=None):
+        hidden = F.relu(self.fc1(local_obs) + self.guidance_context(local_obs, guidance_offsets, guidance_mask))
+        return self.output_layer(F.relu(self.fc2(hidden)))
 
-    def get_policy(self, local_obs, agent_indices=None, eps=DEFAULT_EPS):
-        logits = self.forward(local_obs)
-        probabilities = F.softmax(logits, dim=-1)
-        return probabilities, torch.log(probabilities.clamp_min(float(eps))), logits
+    def get_policy(self, local_obs, agent_indices=None, eps=DEFAULT_EPS, guidance_offsets=None, guidance_mask=None):
+        logits = self.forward(local_obs, guidance_offsets=guidance_offsets, guidance_mask=guidance_mask)
+        return guided_distribution(logits, guidance_offsets, guidance_mask, eps)
 
-    def sample_action(self, local_obs, agent_indices=None):
-        probabilities, log_probabilities, _ = self.get_policy(local_obs)
+    def sample_action(self, local_obs, agent_indices=None, guidance_offsets=None, guidance_mask=None):
+        probabilities, log_probabilities, _ = self.get_policy(local_obs,
+            guidance_offsets=guidance_offsets, guidance_mask=guidance_mask)
         actions = torch.distributions.Categorical(probs=probabilities).sample()
         selected = log_probabilities.gather(1, actions.unsqueeze(1)).squeeze(1)
         return actions, selected, probabilities, log_probabilities
@@ -67,6 +72,7 @@ class RoutingDiscreteQNetwork(nn.Module):
     def __init__(self, global_state_dim, action_dim, num_agents,
                  hidden_dim=conf.ROUTING_CRITIC_HIDDEN_DIM):
         super().__init__()
+        self.guidance_context = GuidanceConditioner(action_dim, hidden_dim)
         self.fc1 = nn.Linear(int(global_state_dim), int(hidden_dim))
         self.fc2 = nn.Linear(int(hidden_dim), int(hidden_dim))
         self.output_layer = nn.Linear(int(hidden_dim), int(action_dim))
@@ -74,8 +80,9 @@ class RoutingDiscreteQNetwork(nn.Module):
         initialize_linear_layer(self.fc2, nn.init.calculate_gain("relu"))
         initialize_linear_layer(self.output_layer, conf.ROUTING_CRITIC_GAIN)
 
-    def forward(self, global_state, agent_indices=None):
-        return self.output_layer(F.relu(self.fc2(F.relu(self.fc1(global_state)))))
+    def forward(self, global_state, agent_indices=None, guidance_offsets=None, guidance_mask=None):
+        hidden = F.relu(self.fc1(global_state) + self.guidance_context(global_state, guidance_offsets, guidance_mask))
+        return self.output_layer(F.relu(self.fc2(hidden)))
 
 
 class RoutingTwinDiscreteCritic(nn.Module):
@@ -85,8 +92,9 @@ class RoutingTwinDiscreteCritic(nn.Module):
         self.q1 = RoutingDiscreteQNetwork(global_state_dim, action_dim, num_agents, hidden_dim)
         self.q2 = RoutingDiscreteQNetwork(global_state_dim, action_dim, num_agents, hidden_dim)
 
-    def forward(self, global_state, agent_indices=None):
-        return self.q1(global_state), self.q2(global_state)
+    def forward(self, global_state, agent_indices=None, guidance_offsets=None, guidance_mask=None):
+        return (self.q1(global_state, guidance_offsets=guidance_offsets, guidance_mask=guidance_mask),
+                self.q2(global_state, guidance_offsets=guidance_offsets, guidance_mask=guidance_mask))
 
 
 def hard_update(target_network: nn.Module, source_network: nn.Module) -> None:
@@ -632,6 +640,10 @@ class RoutingTensorBatch:
     # 当前 RoutingReplayBuffer 已不保存 forced transition，
     # 暂时保留该字段以兼容现有训练检查接口。
     is_forced_action: torch.Tensor
+    guidance_offsets: Optional[torch.Tensor] = None
+    guidance_mask: Optional[torch.Tensor] = None
+    next_guidance_offsets: Optional[torch.Tensor] = None
+    next_guidance_mask: Optional[torch.Tensor] = None
 
 
 @dataclass(frozen=True)
@@ -914,6 +926,7 @@ class LocalRoutingMASAC:
         )
 
         checkpoint = {
+            "guidance_context_version": GUIDANCE_CONTEXT_VERSION,
             # ======================================================
             # Algorithm identity
             #
@@ -963,6 +976,9 @@ class LocalRoutingMASAC:
         #   - 不同 Agent 数量
         #     的 checkpoint 被静默恢复。
         # ==============================================================
+
+        if checkpoint.get("guidance_context_version") != GUIDANCE_CONTEXT_VERSION:
+            raise RuntimeError("Routing guidance context version mismatch; retrain legacy routing weights")
 
         role = checkpoint.get("algorithm_role")
 
@@ -1052,6 +1068,9 @@ class LocalRoutingMASAC:
         batch: RoutingReplayBatch,
     ) -> RoutingTensorBatch:
 
+        if batch.guidance_offsets is not None and getattr(batch, "guidance_context_version", None) != GUIDANCE_CONTEXT_VERSION:
+            raise ValueError("Replay batch guidance context version mismatch")
+
         agent_indices = torch.as_tensor(
             batch.agent_indices,
             dtype=torch.long,
@@ -1124,7 +1143,10 @@ class LocalRoutingMASAC:
         )
 
         return RoutingTensorBatch(
-            agent_indices=agent_indices,
+            guidance_offsets=guidance_tensor(batch.guidance_offsets, self.device),
+            guidance_mask=guidance_tensor(batch.guidance_mask, self.device, mask=True),
+            next_guidance_offsets=guidance_tensor(batch.next_guidance_offsets, self.device),
+            next_guidance_mask=guidance_tensor(batch.next_guidance_mask, self.device, mask=True),            agent_indices=agent_indices,
             local_obs=local_obs,
             global_states=global_states,
             # action_masks=action_masks,
@@ -1160,6 +1182,7 @@ class LocalRoutingMASAC:
         current_q1_all, current_q2_all = self.critic(
             global_state=batch.global_states,
             agent_indices=batch.agent_indices,
+            guidance_offsets=batch.guidance_offsets, guidance_mask=batch.guidance_mask,
         )
 
         # 从 Q1 的全部动作 Q 值中取出实际执行动作对应的值。
@@ -1232,6 +1255,7 @@ class LocalRoutingMASAC:
         action_probs, action_log_probs, _ = self.actor.get_policy(
             local_obs=batch.local_obs,
             agent_indices=batch.agent_indices,
+            guidance_offsets=batch.guidance_offsets, guidance_mask=batch.guidance_mask,
         )
 
         # Actor 更新不需要修改 Critic 参数
@@ -1240,6 +1264,7 @@ class LocalRoutingMASAC:
             q1_all, q2_all = self.critic(
                 global_state=batch.global_states,
                 agent_indices=batch.agent_indices,
+                guidance_offsets=batch.guidance_offsets, guidance_mask=batch.guidance_mask,
             )
 
             # 对每个动作使用较小的 Q 值
@@ -1299,6 +1324,7 @@ class LocalRoutingMASAC:
             action_probs, (action_log_probs), _ = self.actor.get_policy(
                 local_obs=batch.local_obs,
                 agent_indices=(batch.agent_indices),
+                guidance_offsets=batch.guidance_offsets, guidance_mask=batch.guidance_mask,
             )
 
             # 计算每条样本当前策略熵。
@@ -1312,6 +1338,8 @@ class LocalRoutingMASAC:
                 policy_entropy,
                 fill_value=(target_entropy_value),
             )
+            if batch.guidance_mask is not None:
+                target_entropy = float(self.config.target_entropy_ratio) * batch.guidance_mask.sum(-1).clamp_min(1).float().log()
 
             # 统计每条样本的合法动作数量。
             # valid_action_count = batch.action_masks.sum(
@@ -1400,8 +1428,9 @@ class RoutingMASAC:
             raise ValueError(f"Unknown routing agent index: {index}")
         return self.agents[self.edge_dc_ids[index]]
 
-    def get_logits(self, local_obs, agent_index):
-        return self.agent_for_index(agent_index).actor(local_obs)
+    def get_logits(self, local_obs, agent_index, guidance_offsets=None, guidance_mask=None):
+        return self.agent_for_index(agent_index).actor(local_obs,
+            guidance_offsets=guidance_offsets, guidance_mask=guidance_mask)
 
     def select_action(self, local_obs, agent_index, deterministic=False):
         return self.agent_for_index(agent_index).select_action(local_obs, agent_index, deterministic)
@@ -1417,8 +1446,12 @@ class RoutingMASAC:
         for index in torch.unique(indices).tolist():
             rows = nonterminal & (batch.next_agent_indices == index)
             successor = self.agent_for_index(index)
-            probs, log_probs, _ = successor.actor.get_policy(batch.next_local_obs[rows])
-            q1, q2 = successor.target_critic(batch.next_global_states[rows])
+            probs, log_probs, _ = successor.actor.get_policy(batch.next_local_obs[rows],
+                guidance_offsets=None if batch.next_guidance_offsets is None else batch.next_guidance_offsets[rows],
+                guidance_mask=None if batch.next_guidance_mask is None else batch.next_guidance_mask[rows])
+            q1, q2 = successor.target_critic(batch.next_global_states[rows],
+                guidance_offsets=None if batch.next_guidance_offsets is None else batch.next_guidance_offsets[rows],
+                guidance_mask=None if batch.next_guidance_mask is None else batch.next_guidance_mask[rows])
             values[rows] = (probs * (torch.minimum(q1, q2) - successor.alpha.detach() * log_probs)).sum(-1)
         return values
 
@@ -1467,6 +1500,7 @@ class RoutingMASAC:
 
     def structure_metadata(self):
         return {
+            "guidance_context_version": GUIDANCE_CONTEXT_VERSION,
             "parameter_sharing": False,
             "edge_dc_ids": list(self.edge_dc_ids),
             "action_target_dc_ids": list(self.action_target_dc_ids),
@@ -2103,3 +2137,7 @@ def resolve_training_device(
             )
         raise RuntimeError(message) from exc
     return device
+
+
+# One Host network implementation; Routing remains scheduler-specific.
+from schedulers.shared_host import HostSACConfig, LocalHostSAC

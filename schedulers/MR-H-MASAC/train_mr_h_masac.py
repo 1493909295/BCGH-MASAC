@@ -36,6 +36,8 @@ def train(
     routing_observation_builder_type = routing_observation_builder_type or RoutingObservationBuilder
     routing_agent_type = routing_agent_type or RoutingMASAC
 
+    train_config = prepare_scheduler_config(train_config)
+
     set_global_random_seeds(
         train_config.seed,
         device=getattr(routing_masac_config, "device", None) or conf.DEVICE,
@@ -115,11 +117,12 @@ def train(
         # 每个 DC 独立 Local Host SAC。
         # ==========================================================
 
-        host_sac_agents[dc_id] = LocalHostSAC(
-            obs_dim=(host_obs_dim),
-            action_dim=(host_action_dim),
-            config=(host_sac_config),
-        )
+        if not shared_host_mode(train_config):
+            host_sac_agents[dc_id] = LocalHostSAC(
+                obs_dim=(host_obs_dim),
+                action_dim=(host_action_dim),
+                config=(host_sac_config),
+            )
 
         # ==========================================================
         # 第十九步：
@@ -131,7 +134,7 @@ def train(
         #   ReplayBuffer
         # ==========================================================
 
-        host_replay_buffers[dc_id] = HostReplayBuffer(
+        host_replay_buffers[dc_id] = (FrozenHostReplay if shared_host_mode(train_config) else HostReplayBuffer)(
             dc_id=dc_id,
             capacity=int(train_config.host_replay_capacity),
             obs_dim=(host_obs_dim),
@@ -140,6 +143,9 @@ def train(
         )
     if host_initializer is not None:
         host_initializer(env, host_sac_agents)
+
+    if shared_host_mode(train_config):
+        host_sac_agents = load_frozen_hosts(env, train_config.host_checkpoint, host_sac_config.device)
 
     host_training_action_steps: Dict[
         str,
@@ -326,6 +332,8 @@ def train(
     routing_masac.train_mode()
 
     action_rng = np.random.default_rng(int(train_config.seed))
+
+    validate_scheduler_resume(train_config.resume_checkpoint, host_sac_agents, train_config)
 
     (
         start_episode,
@@ -1017,6 +1025,10 @@ def train(
                 neighbor_feedback_store=(neighbor_feedback_store),
             )
 
+            add_host_log_identity(episode_log_row, host_sac_agents)
+            for row in dc_log_rows:
+                add_host_log_identity(row, host_sac_agents)
+
             # ==============================================================
             # Immediate Disk Persistence
             # ==============================================================
@@ -1076,7 +1088,7 @@ def train(
 
 def main() -> None:
     train_config = TrainConfig(
-        num_episodes=conf.Episodes,
+        num_episodes=conf.SCHEDULER_ROUTING_EPISODES,
         routing_replay_capacity=conf.MR_H_MASAC_ROUTING_REPLAY_TOTAL_CAPACITY,
         routing_replay_capacity_per_dc=conf.MR_H_MASAC_ROUTING_REPLAY_CAPACITY_PER_DC,
         host_replay_capacity=(conf.HOST_REPLAY_CAPACITY),
@@ -1099,9 +1111,9 @@ def main() -> None:
         # ==========================================================
         # Three-Stage Training
         # ==========================================================
-        host_pretrain_episodes=(conf.HOST_PRETRAIN_EPISODES),
-        routing_train_episodes=(conf.ROUTING_TRAIN_EPISODES),
-        joint_finetune_episodes=(conf.JOINT_FINETUNE_EPISODES),
+        host_pretrain_episodes=0,
+        routing_train_episodes=conf.SCHEDULER_ROUTING_EPISODES,
+        joint_finetune_episodes=0,
         log_interval=conf.Log_interval,
         checkpoint_interval=conf.Checkpoint_Interval,
         seed=conf.Seed,

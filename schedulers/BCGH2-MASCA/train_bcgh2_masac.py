@@ -76,6 +76,8 @@ def train(
         flush=True,
     )
 
+    train_config = prepare_scheduler_config(train_config)
+
     set_global_random_seeds(train_config.seed)
 
     env = build_environment(
@@ -162,19 +164,23 @@ def train(
 
         host_action_dim = int(host_observation_builder.get_action_dim(dc_id))
 
-        host_sac_agents[dc_id] = LocalHostSAC(
-            obs_dim=(host_obs_dim),
-            action_dim=(host_action_dim),
-            config=(host_sac_config),
-        )
+        if not shared_host_mode(train_config):
+            host_sac_agents[dc_id] = LocalHostSAC(
+                obs_dim=(host_obs_dim),
+                action_dim=(host_action_dim),
+                config=(host_sac_config),
+            )
 
-        host_replay_buffers[dc_id] = HostReplayBuffer(
+        host_replay_buffers[dc_id] = (FrozenHostReplay if shared_host_mode(train_config) else HostReplayBuffer)(
             dc_id=dc_id,
             capacity=int(train_config.host_replay_capacity),
             obs_dim=(host_obs_dim),
             action_dim=(host_action_dim),
             seed=(int(train_config.seed) + 20_000 + host_dc_index),
         )
+    if shared_host_mode(train_config):
+        host_sac_agents = load_frozen_hosts(env, train_config.host_checkpoint, host_sac_config.device)
+
     host_training_action_steps: Dict[
         str,
         int,
@@ -282,6 +288,8 @@ def train(
         routing_masac.initialize_weights(train_config.routing_init_checkpoint)
 
     action_rng = np.random.default_rng(int(train_config.seed))
+
+    validate_scheduler_resume(train_config.resume_checkpoint, host_sac_agents, train_config)
 
     (
         start_episode,
@@ -820,6 +828,10 @@ def train(
                 neighbor_feedback_store=(neighbor_feedback_store),
             )
 
+            add_host_log_identity(episode_log_row, host_sac_agents)
+            for row in dc_log_rows:
+                add_host_log_identity(row, host_sac_agents)
+
             append_csv_log(
                 csv_path=(episode_log_csv_path),
                 row=(episode_log_row),
@@ -873,7 +885,7 @@ def train(
 
 def main() -> None:
     train_config = TrainConfig(
-        num_episodes=conf.Episodes,
+        num_episodes=conf.SCHEDULER_ROUTING_EPISODES,
         routing_replay_capacity=(conf.ROUTING_REPLAY_CAPACITY),
         host_replay_capacity=(conf.HOST_REPLAY_CAPACITY),
         routing_batch_size=(conf.ROUTING_BATCH_SIZE),
@@ -886,9 +898,9 @@ def main() -> None:
         host_learning_starts=(conf.HOST_LEARNING_STARTS),
         host_train_every=(conf.HOST_TRAIN_EVERY),
         host_updates_per_train=(conf.HOST_UPDATES_PER_TRAIN),
-        host_pretrain_episodes=(conf.HOST_PRETRAIN_EPISODES),
-        routing_train_episodes=(conf.ROUTING_TRAIN_EPISODES),
-        joint_finetune_episodes=(conf.JOINT_FINETUNE_EPISODES),
+        host_pretrain_episodes=0,
+        routing_train_episodes=conf.SCHEDULER_ROUTING_EPISODES,
+        joint_finetune_episodes=0,
         log_interval=conf.Log_interval,
         checkpoint_interval=conf.Checkpoint_Interval,
         seed=conf.Seed,

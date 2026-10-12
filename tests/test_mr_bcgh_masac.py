@@ -13,6 +13,8 @@ import pytest
 import torch
 
 
+from host_test_support import make_host_bundle
+
 PACKAGE = "schedulers.MR-BCGH-MASAC"
 networks = importlib.import_module(PACKAGE + ".h_masac_agent")
 experience = importlib.import_module(PACKAGE + ".experience")
@@ -216,7 +218,7 @@ def test_modes_and_per_dc_metrics(system):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Production training requires CUDA")
 @pytest.mark.parametrize("cloud_enabled", [False, True])
-def test_three_stage_training_restore_and_evaluation(tmp_path, monkeypatch, cloud_enabled):
+def test_frozen_host_training_restore_and_evaluation(tmp_path, monkeypatch, cloud_enabled):
     from environment.cloud_edge_env import CloudEdgeEnv
     from environment.env_generate import UseOldEnv
     import config
@@ -235,8 +237,9 @@ def test_three_stage_training_restore_and_evaluation(tmp_path, monkeypatch, clou
 
     monkeypatch.setattr(training, "build_environment", small_environment)
     settings = support.TrainConfig(
-        num_episodes=3, host_pretrain_episodes=1, routing_train_episodes=1,
-        joint_finetune_episodes=1, routing_replay_capacity=128, host_replay_capacity=128,
+        host_checkpoint=str(make_host_bundle(small_environment(42), tmp_path / "host", "cuda:0")),
+        num_episodes=3, host_pretrain_episodes=0, routing_train_episodes=3,
+        joint_finetune_episodes=0, routing_replay_capacity=128, host_replay_capacity=128,
         routing_batch_size=2, host_batch_size=2, routing_random_warmup_steps=2,
         routing_learning_starts=1, host_random_warmup_steps=0, host_learning_starts=1,
         routing_train_every=1, host_train_every=1, routing_updates_per_train=1,
@@ -258,11 +261,11 @@ def test_three_stage_training_restore_and_evaluation(tmp_path, monkeypatch, clou
     with dc_path.open(encoding="utf-8-sig", newline="") as stream:
         dc_rows = list(csv.DictReader(stream))
     assert len(episodes) == 3
-    assert int(episodes[0]["routing_episode_updates"]) == 0
+    assert int(episodes[0]["routing_episode_updates"]) > 0
     assert int(episodes[1]["host_episode_updates"]) == 0
     assert int(episodes[1]["routing_episode_updates"]) > 0
     assert int(episodes[2]["routing_episode_updates"]) > 0
-    assert int(episodes[2]["host_episode_updates"]) > 0
+    assert all(int(row["host_episode_updates"]) == 0 for row in episodes)
     assert len(dc_rows) == 3 * system.num_agents
     assert all(row["routing_parameter_sharing"] == "False" for row in dc_rows)
     assert sum(system.action_steps.values()) == int(episodes[-1]["routing_training_action_steps"])

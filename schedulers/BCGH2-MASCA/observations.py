@@ -2639,3 +2639,7 @@ class NeighborHistoricalFeedbackStore:
             "episode_terminal_jobs_seen": int(self._episode_terminal_jobs_seen),
             "episode_pair_samples": int(self._episode_pair_samples),
         }
+
+
+# All schedulers encode Host observations using the same implementation.
+from schedulers.shared_host import HostObservationBuilder

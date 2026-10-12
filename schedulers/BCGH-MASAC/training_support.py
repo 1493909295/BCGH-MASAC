@@ -39,7 +39,7 @@ from .experience import (
     PendingJobTraceStore,
     RoutingReplayBuffer,
 )
-from .guided_policy import GuidanceLambdaSchedule, GuidedRoutingPolicy
+from .guided_policy import GuidanceDecisionLog, GuidanceLambdaSchedule, GuidedRoutingPolicy
 from .h_masac_agent import (
     HostSACConfig,
     LocalHostSAC,
@@ -819,6 +819,7 @@ class TransitionCollector:
         decision: DecisionSnapshot,
         action: int,
         action_source: str,
+        guidance_snapshot=None,
     ) -> Tuple[
         RoutingActionResult,
         Optional[DecisionSnapshot],
@@ -864,6 +865,11 @@ class TransitionCollector:
         它不一定属于当前 Job，
         因而绝不在本函数中被当作当前 Job 的 Replay next_state。
         """
+
+        if guidance_snapshot is not None:
+            offsets, mask = guidance_snapshot
+            guidance_snapshot = (np.asarray(offsets, dtype=np.float32).copy(),
+                                 np.asarray(mask, dtype=np.bool_).copy())
 
         # ==========================================================
         # 1. 基础检查
@@ -1003,6 +1009,12 @@ class TransitionCollector:
         #   - 只 mark terminal；
         #   - 然后立即 Finalize。
         # ==========================================================
+
+        if guidance_snapshot is not None:
+            offsets, mask = guidance_snapshot
+            step = self.pending_trace_store.get_trace(decision.job_id).routing_steps[-1]
+            step.guidance_offsets = np.asarray(offsets, dtype=np.float32).copy()
+            step.guidance_mask = np.asarray(mask, dtype=np.bool_).copy()
 
         if action_type == "drop":
             self.pending_trace_store.mark_terminal(
@@ -1311,40 +1323,6 @@ class TransitionCollector:
         )
 
 
-# Guidance decision log
-class GuidanceDecisionLog:
-    """One JSONL record per guided decision; allows auditing individual actions."""
-
-    def __init__(self, path):
-        self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.file = self.path.open("w", encoding="utf-8")
-
-    def record(self, *, episode, decision, policy, action, guidance_lambda):
-        self.file.write(
-            json.dumps(
-                dict(
-                    episode=episode,
-                    time=decision.env_time,
-                    job_id=decision.job_id,
-                    source_dc_id=decision.agent_id,
-                    action=action,
-                    guidance_lambda=guidance_lambda,
-                    candidates=[asdict(item) for item in policy.last_breakdowns],
-                ),
-                ensure_ascii=False,
-                allow_nan=False,
-            )
-            + "\n"
-        )
-
-    def flush(self):
-        self.file.flush()
-
-    def close(self):
-        self.file.close()
-
-
 # Training configuration and support
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -1383,8 +1361,10 @@ ENVIRONMENT_DIR = PROJECT_ROOT / "environment"
 
 @dataclass(frozen=True)
 class TrainConfig:
+    host_checkpoint: Optional[str] = conf.SHARED_HOST_CHECKPOINT
+    host_training_mode: str = "frozen"
 
-    num_episodes: int = conf.Episodes
+    num_episodes: int = conf.SCHEDULER_ROUTING_EPISODES
 
     routing_replay_capacity: int = conf.ROUTING_REPLAY_CAPACITY
     host_replay_capacity: int = conf.HOST_REPLAY_CAPACITY
@@ -1401,9 +1381,9 @@ class TrainConfig:
     host_updates_per_train: int = conf.HOST_UPDATES_PER_TRAIN
 
     # Three-stage training
-    host_pretrain_episodes: int = conf.HOST_PRETRAIN_EPISODES
-    routing_train_episodes: int = conf.ROUTING_TRAIN_EPISODES
-    joint_finetune_episodes: int = conf.JOINT_FINETUNE_EPISODES
+    host_pretrain_episodes: int = 0
+    routing_train_episodes: int = conf.SCHEDULER_ROUTING_EPISODES
+    joint_finetune_episodes: int = 0
     log_interval: int = conf.Log_interval
     checkpoint_interval: int = conf.Checkpoint_Interval  # 兼容旧调用，双层训练不按间隔保存
     seed: int = conf.Seed
@@ -1424,10 +1404,17 @@ class TrainConfig:
     )
     enable_bayesian_game: bool = conf.BCGH_ENABLE_BAYESIAN_GAME
     enable_heuristic_guidance: bool = conf.BCGH_ENABLE_HEURISTIC_GUIDANCE
+    scoring_mode: str = conf.BCGH_SCORING_MODE
+    resource_penalty_enabled: bool = conf.BCGH_RESOURCE_PENALTY_ENABLED
+    transit_penalty_enabled: bool = conf.BCGH_TRANSIT_PENALTY_ENABLED
+    guidance_log_every: int = conf.BCGH_GUIDANCE_LOG_EVERY
     bayesian_prior_alpha: float = conf.BCGH_BAYESIAN_PRIOR_ALPHA
     bayesian_prior_beta: float = conf.BCGH_BAYESIAN_PRIOR_BETA
     bayesian_confidence_scale: float = conf.BCGH_BAYESIAN_CONFIDENCE_SCALE
     short_window_s: float = conf.BCGH_SHORT_WINDOW_S
+    pressure_residence_s: float = conf.BCGH_PRESSURE_RESIDENCE_S
+    pressure_background_cpu: float = conf.BCGH_PRESSURE_BACKGROUND_CPU
+    pressure_background_gpu: float = conf.BCGH_PRESSURE_BACKGROUND_GPU
     source_evidence_weight: float = conf.BCGH_SOURCE_EVIDENCE_WEIGHT
     source_volume_scale: float = conf.BCGH_SOURCE_VOLUME_SCALE
     source_confidence_scale: float = conf.BCGH_SOURCE_CONFIDENCE_SCALE
@@ -1464,7 +1451,13 @@ def bcgh_guidance_metadata(train_config):
     names = (
         "enable_bayesian_game",
         "enable_heuristic_guidance",
+        "scoring_mode",
+        "resource_penalty_enabled",
+        "transit_penalty_enabled",
         "short_window_s",
+        "pressure_residence_s",
+        "pressure_background_cpu",
+        "pressure_background_gpu",
         "bayesian_prior_alpha",
         "bayesian_prior_beta",
         "bayesian_confidence_scale",
@@ -1505,11 +1498,15 @@ def bcgh_guidance_metadata(train_config):
         value = getattr(train_config, name)
         parameters[name] = list(value) if isinstance(value, tuple) else value
     return {
-        "version": 3,
+        "version": 5,
+        "outcome_semantics": "local_remote_terminal_observation_window_same_quality_confidence",
         "clock": "episode_simulation_seconds",
         "source_semantics": "local_queue_direct_previous_hop_bounded_soft_evidence",
-        "pressure_semantics": "executed_edge_transfer_cpu_gpu_marginal_cost",
-        "absorption_semantics": "directed_edge_successor_self_edge_cloud_drop",
+        "pressure_semantics": "survival_remaining_commitments_release_on_departure",
+        "policy_semantics": "causal_replay_context_conditioned_composite_distribution",
+        "guidance_context_version": 1,
+        "guidance_context_features": ["effective_lambda_bias", "static_forbidden_mask"],
+        "absorption_semantics": "started_queued_edge_cloud_drop_then_terminal_local_sla",
         "parameters": parameters,
     }
 
@@ -1569,6 +1566,13 @@ def validate_bcgh_feature_config(
     历史拥塞压力；Heuristic Guidance 在此状态之上生成 Actor Bias，
     因而不能脱离 Bayesian Game 单独启用。
     """
+
+    if train_config.scoring_mode not in {"symmetric", "legacy"}:
+        raise ValueError("scoring_mode must be symmetric or legacy")
+    if (isinstance(train_config.guidance_log_every, bool)
+            or not isinstance(train_config.guidance_log_every, int)
+            or train_config.guidance_log_every < 1):
+        raise ValueError("guidance_log_every must be a positive integer")
 
     bayesian_enabled = bool(train_config.enable_bayesian_game)
     heuristic_enabled = bool(train_config.enable_heuristic_guidance)
@@ -2655,6 +2659,7 @@ def flush_finalized_trace_to_replay(
     # 结果在终止后才可见；按仿真时间更新短窗口后验。
     # 竞争需求已在转发执行时记录，不能在这里重复累计。
     if bayesian_game is not None:
+        bayesian_game.update_guidance_outcomes(finalized_trace, env)
         for evidence in bayesian_evidences:
             bayesian_game.update_belief(
                 evidence,
@@ -2697,6 +2702,8 @@ def consume_environment_outcome_events(
     # Environment 只返回 Job Outcome Facts。
     # ==============================================================
 
+    if bayesian_game is not None and hasattr(bayesian_game, 'lifecycle_runtime'):
+        bayesian_game.lifecycle_runtime.consume_service_events(env)
     outcome_events = env.pop_job_outcome_events()
 
     if not outcome_events:
@@ -4241,6 +4248,9 @@ def save_two_layer_checkpoint(
         },
     }
 
+    if shared_host_mode(train_config):
+        checkpoint_metadata["shared_host"] = host_reference(host_sac_agents)
+
     state_path = checkpoint_state_path(model_path)
 
     atomic_checkpoint_text_write(
@@ -4305,6 +4315,8 @@ def load_two_layer_checkpoint_if_needed(
         host_training_action_steps
         best_episode_return
     """
+
+    validate_scheduler_resume(resume_checkpoint, host_sac_agents, train_config)
 
     # ==========================================================
     # 默认 Host Training Step
@@ -4457,7 +4469,7 @@ def load_two_layer_checkpoint_if_needed(
             raise RuntimeError(
                 "Checkpoint BCGH guidance semantics/configuration differ from this run. "
                 "Use matching short-window parameters or start a new training run; "
-                "legacy guidance checkpoints cannot silently resume as v3."
+                "legacy guidance checkpoints cannot silently resume as v5."
             )
 
     # ==========================================================
@@ -5817,14 +5829,21 @@ def print_episode_summary(
 
 # Loaded-model evaluation
 def evaluate_episode(env, routing_agent, host_agents, settings, *, seed=42, deterministic=True):
-    if not settings.enable_bayesian_game or not settings.enable_heuristic_guidance:
-        raise ValueError("Full BCGH evaluation requires Bayesian game and guidance enabled")
-    runtime = ShortWindowRuntime(build_short_window_game(env, settings))
-    feedback = ShortWindowFeedbackStore(
-        env,
-        window_s=settings.short_window_s,
-        confidence_scale_samples=settings.bayesian_confidence_scale,
-    )
+
+    validate_frozen_host_context(env, host_agents, settings)
+    validate_bcgh_feature_config(settings)
+    runtime = ShortWindowRuntime(build_short_window_game(env, settings)) if settings.enable_bayesian_game else None
+    if runtime is not None:
+        feedback = ShortWindowFeedbackStore(
+            env, window_s=settings.short_window_s,
+            confidence_scale_samples=settings.bayesian_confidence_scale,
+        )
+    else:
+        feedback = NeighborHistoricalFeedbackStore(
+            env, ewma_alpha=settings.neighbor_feedback_ewma_alpha,
+            age_scale_samples=settings.neighbor_feedback_age_scale_samples,
+            confidence_scale_samples=settings.neighbor_feedback_confidence_scale_samples,
+        )
     routing_obs = RoutingObservationBuilder(
         env,
         use_neighbor_historical_feedback=settings.use_neighbor_historical_feedback,
@@ -5861,7 +5880,7 @@ def evaluate_episode(env, routing_agent, host_agents, settings, *, seed=42, dete
         env, routing_obs, routing_state, traces, reward, short_window_runtime=runtime
     )
     policy = GuidedRoutingPolicy(
-        routing_agent, env.routing_action_target_dc_ids, enabled=True, bayesian_game=runtime.game
+        routing_agent, env.routing_action_target_dc_ids, enabled=settings.enable_heuristic_guidance, bayesian_game=None if runtime is None else runtime.game
     )
     env.reset(seed=seed)
     routing_count = 0
@@ -5870,11 +5889,15 @@ def evaluate_episode(env, routing_agent, host_agents, settings, *, seed=42, dete
     def finalize(trace):
         if settings.collect_neighbor_historical_feedback:
             feedback.update_from_finalized_trace(trace)
-        for item in build_bayesian_evidence_from_finalized_trace(trace, env):
-            runtime.game.update_belief(item, update_clock=env.current_time)
+        if runtime is not None:
+            runtime.game.update_guidance_outcomes(trace, env)
+            for item in build_bayesian_evidence_from_finalized_trace(trace, env):
+                runtime.game.update_belief(item, update_clock=env.current_time)
         traces.pop_finalized_trace(trace.job_id)
 
     def consume_outcomes():
+        if runtime is not None:
+            runtime.consume_service_events(env)
         for event in env.pop_job_outcome_events():
             traces.record_reward_event(
                 job_id=str(event["job_id"]),
@@ -5891,7 +5914,7 @@ def evaluate_episode(env, routing_agent, host_agents, settings, *, seed=42, dete
             ctx = env.get_pending_host_decision()
             dc, job_id, now = str(ctx["dc_id"]), str(ctx["job_id"]), float(env.current_time)
             obs = host_obs.build(dc_id=dc, job_id=job_id)
-            action = host_agents[dc].select_action(obs, deterministic=deterministic)
+            action = host_agents[dc].select_action(obs, deterministic=True if shared_host_mode(settings) else deterministic)
             result = env.execute_pending_host_action(host_action=action)
             traces.record_host_step(
                 job_id=job_id,
@@ -5905,12 +5928,13 @@ def evaluate_episode(env, routing_agent, host_agents, settings, *, seed=42, dete
             traces.record_host_result(
                 job_id=job_id, result=result["execution_result"], env_time=float(result["env_time"])
             )
-            runtime.record_host_result(
-                job_id=job_id,
-                dc_id=dc,
-                execution_result=str(result["execution_result"]),
-                now=float(result["env_time"]),
-            )
+            if runtime is not None:
+                runtime.record_host_result(
+                    job_id=job_id,
+                    dc_id=dc,
+                    execution_result=str(result["execution_result"]),
+                    now=float(result["env_time"]),
+                )
         elif collector.drain_one_dead_agent():
             continue
         else:
@@ -5918,7 +5942,7 @@ def evaluate_episode(env, routing_agent, host_agents, settings, *, seed=42, dete
             if decision.forced_action is not None:
                 action, source = decision.forced_action, "forced"
             else:
-                context = runtime.build_action_context(policy, env, decision, feedback)
+                context = runtime.build_action_context(policy, env, decision, feedback) if runtime is not None else None
                 action = policy.select_action(
                     decision.local_obs,
                     decision.agent_index,
@@ -5931,7 +5955,8 @@ def evaluate_episode(env, routing_agent, host_agents, settings, *, seed=42, dete
                 source_evidence_decisions += int(
                     any(x.source_signal > 0 for x in policy.last_breakdowns)
                 )
-            result, _ = collector.execute_and_record(decision, action, action_source=source)
+            result, _ = collector.execute_and_record(decision, action, action_source=source,
+                guidance_snapshot=policy.last_guidance_snapshot if source == "policy" else None)
             routing_count += 1
             if result.job_finalized:
                 finalize(traces.get_finalized_trace(result.job_id))
@@ -5941,11 +5966,20 @@ def evaluate_episode(env, routing_agent, host_agents, settings, *, seed=42, dete
     traces.assert_no_unflushed_finalized_trace()
     return {
         **calculate_service_metrics(env),
-        "guidance_lambda": settings.guidance_lambda_stage3_end,
+        "guidance_lambda": settings.guidance_lambda_stage3_end if policy.enabled else 0.0,
+        "scoring_mode": settings.scoring_mode,
+        **policy.diagnostics(),
         "routing_decisions": routing_count,
         "source_evidence_decisions": source_evidence_decisions,
-        "absorption": runtime.absorption_summary(),
+        "absorption": runtime.absorption_summary() if runtime is not None else {},
     }
 
+
+# Canonical Host contract shared by all five schedulers.
+from schedulers.shared_host import (
+    HostSACConfig, LocalHostSAC, HostObservationBuilder, FrozenHostReplay,
+    shared_host_mode, prepare_scheduler_config, load_frozen_hosts,
+    host_reference, validate_scheduler_resume, add_host_log_identity, validate_frozen_host_context,
+)
 
 __all__ = [name for name in globals() if not name.startswith("__")]

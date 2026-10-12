@@ -780,6 +780,7 @@ class CloudEdgeEnv(AECEnv):
         self.max_waiting_queue_length = 0
         # 每个 Episode 都重新清空 Environment Fact Queue。
         self.pending_job_outcome_events = []
+        self.pending_job_service_events = []
 
         # 当前还没有执行 Routing action。
         self.last_routing_action_facts = None
@@ -2155,6 +2156,11 @@ class CloudEdgeEnv(AECEnv):
         if not started:
             return False
 
+        if not hasattr(self, 'pending_job_service_events'):
+            self.pending_job_service_events = []
+        self.pending_job_service_events.append(dict(job_id=job_id, dc_id=dc_id,
+            env_time=float(self.current_time), event='started'))
+
         # actual_waiting_time = job.get_waiting_time()
         # if actual_waiting_time is None:
         #     actual_waiting_time = 0.0
@@ -2668,6 +2674,12 @@ class CloudEdgeEnv(AECEnv):
                     ),
             }
         )
+
+    def pop_job_service_events(self):
+        """Service facts are separate from reward/terminal outcome events."""
+        events = list(getattr(self, 'pending_job_service_events', ()))
+        self.pending_job_service_events = []
+        return events
 
     def pop_job_outcome_events(
             self,

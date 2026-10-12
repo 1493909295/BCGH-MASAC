@@ -12,6 +12,7 @@ if not __package__:
     __package__ = "schedulers.BCGH-MASAC"
 
 from .training_support import *
+from schedulers.shared_host import routing_guidance_lambda
 from .h_masac_agent import resolve_training_device
 
 
@@ -49,6 +50,8 @@ def train(
         "============================================================\n",
         flush=True,
     )
+
+    train_config = prepare_scheduler_config(train_config)
 
     set_global_random_seeds(train_config.seed)
 
@@ -158,11 +161,12 @@ def train(
         # 每个 DC 独立 Local Host SAC。
         # ==========================================================
 
-        host_sac_agents[dc_id] = LocalHostSAC(
-            obs_dim=(host_obs_dim),
-            action_dim=(host_action_dim),
-            config=(host_sac_config),
-        )
+        if not shared_host_mode(train_config):
+            host_sac_agents[dc_id] = LocalHostSAC(
+                obs_dim=(host_obs_dim),
+                action_dim=(host_action_dim),
+                config=(host_sac_config),
+            )
 
         # ==========================================================
         # 第十九步：
@@ -174,13 +178,16 @@ def train(
         #   ReplayBuffer
         # ==========================================================
 
-        host_replay_buffers[dc_id] = HostReplayBuffer(
+        host_replay_buffers[dc_id] = (FrozenHostReplay if shared_host_mode(train_config) else HostReplayBuffer)(
             dc_id=dc_id,
             capacity=int(train_config.host_replay_capacity),
             obs_dim=(host_obs_dim),
             action_dim=(host_action_dim),
             seed=(int(train_config.seed) + 20_000 + host_dc_index),
         )
+    if shared_host_mode(train_config):
+        host_sac_agents = load_frozen_hosts(env, train_config.host_checkpoint, host_sac_config.device)
+
     host_training_action_steps: Dict[
         str,
         int,
@@ -314,6 +321,7 @@ def train(
         local_obs_dim=(routing_obs_dim),
         global_state_dim=(routing_global_state_dim),
         seed=int(train_config.seed),
+        require_guidance=bool(train_config.enable_heuristic_guidance),
     )
 
     # 没有传入算法配置时，使用 MASACConfig 默认值，但让算法随机种子与训练配置保持一致
@@ -383,6 +391,8 @@ def train(
     )
 
     action_rng = np.random.default_rng(int(train_config.seed))
+
+    validate_scheduler_resume(train_config.resume_checkpoint, host_sac_agents, train_config)
 
     (
         start_episode,
@@ -477,17 +487,20 @@ def train(
         flush=True,
     )
 
-    # 暂停引导决策 JSONL 日志；恢复时取消以下四处日志调用的注释。
-    # guidance_log = (
-    #     GuidanceDecisionLog(episode_log_csv_path.with_suffix(".guidance.jsonl"))
-    #     if guided_policy.enabled
-    #     else None
-    # )
+    guidance_log = (
+        GuidanceDecisionLog(episode_log_csv_path.with_suffix(".guidance.jsonl"), train_config.guidance_log_every)
+        if guided_policy.enabled else None
+    )
+    if guidance_log is not None:
+        bayesian_game.terminal_audit_callback = lambda trace, outcomes: guidance_log.record_terminal(
+            episode=episode, trace=trace, outcomes=outcomes
+        )
     try:
         # 从 start_episode 训练到 num_episodes，包含最后一个 episode。
         for episode in range(int(start_episode), int(train_config.num_episodes) + 1):
-            # if guidance_log is not None:
-            #     guidance_log.flush()
+            if guidance_log is not None:
+                guidance_log.flush()
+            guided_policy.reset_diagnostics()
 
             ##################### 一轮 episode 开始前的准备 ####################
             # 根据配置决定当前 episode 使用哪个环境 seed
@@ -510,20 +523,8 @@ def train(
                 train_config=(train_config),
             )
 
-            # 第 8 步：按现有三阶段边界计算当前 Episode 的 λ。
-            # Stage 1 恒为 0；Stage 2 线性 warm-up；Stage 3 线性 decay。
-            scheduled_guidance_lambda = guidance_lambda_schedule.lambda_for_episode(
-                stage=training_stage.value,
-                episode=episode,
-                stage_start_episode=training_stage_start_episode(
-                    stage=training_stage,
-                    train_config=train_config,
-                ),
-                stage_end_episode=training_stage_end_episode(
-                    stage=training_stage,
-                    train_config=train_config,
-                ),
-            )
+            # Routing-only warmup/decay; Host remains frozen for the full budget.
+            scheduled_guidance_lambda = routing_guidance_lambda(train_config, episode - int(train_config.host_pretrain_episodes))
             guidance_lambda = float(scheduled_guidance_lambda if guided_policy.enabled else 0.0)
 
             if episode == training_stage_start_episode(
@@ -947,19 +948,27 @@ def train(
                 # Trainer 不再复制 action_type 推断逻辑。
                 # ==========================================================
 
-                # if guidance_log is not None and action_source == "policy":
-                #     guidance_log.record(
-                #         episode=episode,
-                #         decision=decision,
-                #         policy=guided_policy,
-                #         action=action,
-                #         guidance_lambda=guidance_lambda,
-                #     )
+                if guidance_log is not None and action_source == "policy":
+                    guidance_log.record(
+                        episode=episode,
+                        sequence_index=(len(pending_trace_store.get_trace(decision.job_id).routing_steps)
+                                        if pending_trace_store.has_trace(decision.job_id) else 0),
+                        decision=decision,
+                        policy=guided_policy,
+                        action=action,
+                        guidance_lambda=guidance_lambda,
+                    )
+
+                guidance_snapshot = guided_policy.last_guidance_snapshot if action_source == "policy" else None
+                if action_source == "random" and guided_policy.enabled:
+                    warmup_context = short_window_runtime.build_action_context(guided_policy, env, decision, neighbor_feedback_store)
+                    guidance_snapshot = guided_policy.snapshot_context(decision.agent_id, warmup_context, guidance_lambda)
 
                 routing_result, next_decision = collector.execute_and_record(
                     decision=decision,
                     action=action,
                     action_source=(action_source),
+                    guidance_snapshot=guidance_snapshot,
                 )
 
                 decision = next_decision
@@ -1167,6 +1176,25 @@ def train(
                 neighbor_feedback_store=(neighbor_feedback_store),
             )
 
+            if short_window_runtime is not None:
+                episode_log_row.update(short_window_runtime.lifecycle.metrics())
+                for row in dc_log_rows:
+                    row.update(short_window_runtime.lifecycle.metrics(str(row['dc_id'])))
+            episode_log_row.update(guided_policy.diagnostics())
+            episode_log_row.update(
+                scoring_mode=train_config.scoring_mode,
+                resource_penalty_enabled=train_config.resource_penalty_enabled,
+                transit_penalty_enabled=train_config.transit_penalty_enabled,
+                bcgh_bayesian_game_enabled=train_config.enable_bayesian_game,
+                bcgh_heuristic_guidance_enabled=train_config.enable_heuristic_guidance,
+            )
+            if guidance_log is not None:
+                guidance_log.flush()
+            add_host_log_identity(episode_log_row, host_sac_agents)
+            for row in dc_log_rows:
+                row.update(guided_policy.diagnostics(str(row["dc_id"])))
+                add_host_log_identity(row, host_sac_agents)
+
             # ==============================================================
             # Immediate Disk Persistence
             # ==============================================================
@@ -1194,8 +1222,8 @@ def train(
                 best_episode_return = float(stats.episode_return)
 
     finally:
-        # if guidance_log is not None:
-        #     guidance_log.close()
+        if guidance_log is not None:
+            guidance_log.close()
         close_method = getattr(env, "close", None)
         if callable(close_method):
             close_method()
@@ -1228,7 +1256,7 @@ def train(
 
 def main() -> None:
     train_config = TrainConfig(
-        num_episodes=conf.Episodes,
+        num_episodes=conf.SCHEDULER_ROUTING_EPISODES,
         routing_replay_capacity=(conf.ROUTING_REPLAY_CAPACITY),
         host_replay_capacity=(conf.HOST_REPLAY_CAPACITY),
         # ==========================================================
@@ -1250,9 +1278,9 @@ def main() -> None:
         # ==========================================================
         # Three-Stage Training
         # ==========================================================
-        host_pretrain_episodes=(conf.HOST_PRETRAIN_EPISODES),
-        routing_train_episodes=(conf.ROUTING_TRAIN_EPISODES),
-        joint_finetune_episodes=(conf.JOINT_FINETUNE_EPISODES),
+        host_pretrain_episodes=0,
+        routing_train_episodes=conf.SCHEDULER_ROUTING_EPISODES,
+        joint_finetune_episodes=0,
         log_interval=conf.Log_interval,
         checkpoint_interval=conf.Checkpoint_Interval,
         seed=conf.Seed,
